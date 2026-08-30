@@ -248,7 +248,16 @@ def build_sft_split(
                 f"eligible SFT record {index} has no reviewed task identity; "
                 "formal train/validation isolation cannot be proven"
             )
-    validation_indices = [index for index in range(len(records)) if _task_key_for(index, records[index], audits) in val_keys]
+    # Validation is task-isolated and ``val_gold10`` is intended to be a
+    # clean gold-only view.  Keep only strict_gold rows from the selected task
+    # groups; partial or non-SFT audit rows stay in the canonical and
+    # per-class artifacts, but must not be emitted to val_gold10.jsonl.
+    validation_indices = [
+        index
+        for index in range(len(records))
+        if _task_key_for(index, records[index], audits) in val_keys
+        and records[index].get("trainer_metadata", {}).get("trajectory_class") == "strict_gold"
+    ]
     train_indices = [
         index for index, record in enumerate(records)
         if _task_key_for(index, record, audits) not in val_keys and is_sft_eligible(record)

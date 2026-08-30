@@ -84,6 +84,11 @@ python .\sft\merge_travel_sft.py `
 - `*.audit.json`：私有清洗事件、任务对齐和终局诊断；
 - `*.manifest.json`：schema/template hash、长度分位数、分类和有效监督 token。
 
+正式训练使用 `travel_sft_qwen35_split/train.jsonl` 和
+`travel_sft_qwen35_split/val_gold10.jsonl`；后者只保留固定 10 个 task group
+中的 `strict_gold` 记录，`partial_correct` 与非 SFT 分类仅保留在 canonical
+和分类审计文件中。
+
 清洗器从错误 Assistant Turn 开始删除不可恢复错误的整个后缀。公开拒绝且有
 后续修复的 action-before-search、answer-before-search、跨 aspect、重复 Search、
 无效参数、不可见 ID、重复 Answer 和模糊 Action 会保留为 mask=0 上下文，修复

@@ -19,7 +19,7 @@
     "travel44::apartment:4-305|restaurant:4-291"
   ],
   "train_record_count": 490,
-  "validation_record_count": 14,
+  "validation_record_count": 10,
   "train_task_count": 389,
   "validation_task_count": 10,
   "source_record_count": 795,
