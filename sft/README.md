@@ -40,8 +40,12 @@ python .\eval\eval.py `
   --sft-collection --thinking enabled --include-think --require-think `
   --task-pool-manifest .\data\task_pools\travel_task_pools.json `
   --task-pool sft `
-  --max_turns 16 --save_name outputs/deepseek_teacher_sft
+  --max_turns 25 --save_name outputs/deepseek_teacher_sft
 ```
+
+首次真实采集先将 `--task-pool sft_smoke`（固定分层 20-task）并使用
+`pass_k=2` 的 Teacher cache；smoke 通过后改为 `--task-pool sft`，沿用同一
+`--save_name`/cache 即可从已完成的 task/pass 继续，不会重复调用。
 
 这一步只生成 Teacher cache，不覆盖仓库中的 244 条原始文件；6 条 quarantine
 记录不会进入采集清单。API 的

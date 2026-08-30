@@ -58,8 +58,9 @@ python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
     --config-name='grpo_multiturn' \
     algorithm.adv_estimator=grpo_multiturn \
+    algorithm.dynamic_sampling.enable=true \
     algorithm.gamma=0.8 \
-    data.train_batch_size=128 \
+    data.train_batch_size=8 \
     data.max_prompt_length=1152 \
     data.max_response_length=31616 \
     data.filter_overlong_prompts=True \
@@ -70,7 +71,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.lora_alpha=32 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -88,7 +89,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.40 \
     actor_rollout_ref.rollout.max_model_len=32768 \
     actor_rollout_ref.rollout.n=4 \
-    actor_rollout_ref.rollout.multi_turn.max_turns=16 \
+    actor_rollout_ref.rollout.multi_turn.max_turns=25 \
     actor_rollout_ref.rollout.multi_turn.model_name="$MULTITURN_MODEL_NAME" \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$CONFIG_PATH/tool_config/interact_tool_config.yaml" \
     actor_rollout_ref.rollout.multi_turn.turn_level_method="off" \
@@ -99,10 +100,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger="$TRACKING_LOGGERS" \
     trainer.project_name='TravelGym' \
-    trainer.experiment_name='travelgym_qwen35_4b_terminal_search_action_answer' \
+    trainer.experiment_name='travelgym_qwen35_4b_terminal_bs8' \
     trainer.n_gpus_per_node="$N_GPUS_PER_NODE" \
     trainer.nnodes=1 \
-    trainer.save_freq=1 \
+    trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.val_before_train=False \
     data.train_files="$TRAIN_FILES" \

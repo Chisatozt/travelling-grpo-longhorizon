@@ -21,7 +21,11 @@ import hashlib
 import sys
 import time
 import re
+import uuid
+import random
+from urllib.parse import urlsplit
 from pathlib import Path
+from typing import Any, Mapping
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional runtime dependency
@@ -32,6 +36,11 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 # settings such as MAX_WORKER_NUM and PROJECT_ROOT.  Explicit process
 # environment variables win over .env values (override=False).
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    # ``python eval/eval.py`` sets sys.path[0] to ``eval/``.  Add the project
+    # root explicitly so the TravelGym and local VERL packages resolve from
+    # the documented repository-root command as well as from ``python -m``.
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 load_dotenv(REPOSITORY_ROOT / ".env", override=False)
 
 # Windows terminals often default to a GBK code page.  API responses and
@@ -83,12 +92,56 @@ except ImportError:  # ``python eval/eval.py``
     from sft.task_pools import TaskPoolError, assert_task_pools_disjoint, load_pool_manifest
 
 try:
-    from .teacher_collection import TeacherCache, TeacherCacheError, make_provenance
+    from .teacher_collection import (
+        TeacherCache,
+        TeacherCacheError,
+        code_revision,
+        make_provenance,
+        summarize_pass_stats,
+    )
 except ImportError:  # direct script execution
-    from teacher_collection import TeacherCache, TeacherCacheError, make_provenance
+    from teacher_collection import (
+        TeacherCache,
+        TeacherCacheError,
+        code_revision,
+        make_provenance,
+        summarize_pass_stats,
+    )
 
-MAX_WORKER_NUM = int(os.environ.get("MAX_WORKER_NUM", 25))
-semaphore = asyncio.Semaphore(MAX_WORKER_NUM)
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer setting without allowing a broken .env value."""
+
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return int(default)
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+# ``MAX_WORKER_NUM`` remains the backwards-compatible evaluator knob.  Teacher
+# collection can tune rollout slots and API request slots independently: one
+# rollout may issue several sequential User Simulator calls, so a single
+# semaphore either under-utilises the endpoint or allows too many nested calls.
+MAX_WORKER_NUM = _positive_int_env("MAX_WORKER_NUM", 25)
+TEACHER_ROLLOUT_CONCURRENCY = _positive_int_env(
+    "TEACHER_ROLLOUT_CONCURRENCY", MAX_WORKER_NUM
+)
+TEACHER_ACTOR_REQUEST_CONCURRENCY = _positive_int_env(
+    "TEACHER_ACTOR_REQUEST_CONCURRENCY", TEACHER_ROLLOUT_CONCURRENCY
+)
+TEACHER_USER_REQUEST_CONCURRENCY = _positive_int_env(
+    "TEACHER_USER_REQUEST_CONCURRENCY", TEACHER_ROLLOUT_CONCURRENCY
+)
+TEACHER_TRACKING_LOG_EVERY = _positive_int_env("TEACHER_TRACKING_LOG_EVERY", 8)
+
+rollout_semaphore = asyncio.Semaphore(TEACHER_ROLLOUT_CONCURRENCY)
+actor_request_semaphore = asyncio.Semaphore(TEACHER_ACTOR_REQUEST_CONCURRENCY)
+user_request_semaphore = asyncio.Semaphore(TEACHER_USER_REQUEST_CONCURRENCY)
 
 PROJECT_ROOT = os.getenv("PROJECT_ROOT", str(Path(__file__).resolve().parent))
 DEFAULT_MANIFEST_PATH = Path(__file__).resolve().parent / "travel_manifest.json"
@@ -116,6 +169,69 @@ def _resolve_repository_path(value: str | Path) -> Path:
             return resolved
     # Return a stable repository-relative location for a useful error message.
     return (REPOSITORY_ROOT / candidate).resolve()
+
+
+def stable_json_hash(value: Any) -> str:
+    """Hash a JSON-compatible manifest without exposing its contents."""
+
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def public_endpoint_label(value: str | None) -> str:
+    """Return an API endpoint label with credentials/query strings removed."""
+
+    text = str(value or "").strip()
+    if not text:
+        return "unset"
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme and parsed.hostname:
+            host = parsed.hostname
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            try:
+                port = parsed.port
+            except ValueError:
+                port = None
+            netloc = f"{host}:{port}" if port else host
+            path = parsed.path.rstrip("/")
+            return f"{parsed.scheme}://{netloc}{path}"
+    except ValueError:
+        pass
+    # Invalid/local labels are still made safe for tracking; never retain a
+    # query string where an accidental credential could have been embedded.
+    return re.sub(r"[?#].*$", "", text).rstrip("/") or "unset"
+
+
+def resolve_collection_run_id(
+    collection_path: Path,
+    requested: str | None,
+    save_name: str,
+) -> str:
+    """Create one unique run ID and reuse it when resuming an existing cache."""
+
+    if requested and str(requested).strip():
+        return str(requested).strip()
+    if collection_path.is_file():
+        try:
+            payload = json.loads(collection_path.read_text(encoding="utf-8"))
+            existing = payload.get("collection_run_id") if isinstance(payload, dict) else None
+            if existing:
+                return str(existing)
+        except (OSError, json.JSONDecodeError):
+            # TeacherCache will emit the authoritative malformed-cache error;
+            # do not hide it behind run-id discovery.
+            pass
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(str(save_name)).name).strip("-") or "teacher"
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"{label}-teacher-{timestamp}-{uuid.uuid4().hex[:12]}"
 
 
 def load_test_set_manifest(path: str | Path) -> tuple[Path, dict]:
@@ -286,7 +402,15 @@ def load_task_pool_selection(path: str | Path, pool_name: str) -> tuple[Path, di
     return manifest_path, manifest, selected, next(iter(splits))
 
 
-async def build_env(data, max_turns, seed=None, telemetry=None):
+async def build_env(
+    data,
+    max_turns,
+    seed=None,
+    telemetry=None,
+    *,
+    model_client=None,
+    user_request_limit=None,
+):
     gold = data["gold"]
     env_name = data["env_name"]
     model_name = os.environ.get("USER_MODEL_NAME", "gpt-4o")
@@ -319,6 +443,13 @@ async def build_env(data, max_turns, seed=None, telemetry=None):
     env = travelgym.TravelEnv(config=config)
     if isinstance(telemetry, dict):
         env._telemetry = telemetry
+    # These are evaluator-private handles.  TravelGym copies them into the
+    # internal User Simulator model config, never into the public observation
+    # or conversation history.  Reusing the collection client avoids opening
+    # one HTTP connection per simulator call.
+    env._model_client = model_client
+    env._request_semaphore = user_request_limit
+    env._model_max_attempts = _positive_int_env("MODEL_MAX_ATTEMPTS", 3)
     env.reset()
     return env
 
@@ -348,12 +479,16 @@ def _record_actor_usage(telemetry, response, elapsed_seconds):
 def _new_telemetry():
     return {
         "actor_api_calls": 0,
+        "actor_api_errors": 0,
+        "actor_retries": 0,
         "actor_prompt_tokens": 0,
         "actor_completion_tokens": 0,
         "actor_total_tokens": 0,
         "actor_reasoning_tokens": 0,
         "actor_wall_time_seconds": 0.0,
         "user_api_calls": 0,
+        "user_api_errors": 0,
+        "user_retries": 0,
         "user_prompt_tokens": 0,
         "user_completion_tokens": 0,
         "user_total_tokens": 0,
@@ -417,6 +552,42 @@ def _sft_assistant_message(response, json_args, model_name, include_think=False,
     return result
 
 
+def _provider_error_label(exc: BaseException) -> str:
+    """Return a credential-free provider error label for logs/telemetry."""
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    return f"{type(exc).__name__}(status={status})"
+
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """Retry only transport, throttling and server-side failures."""
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is not None:
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+        if status in {408, 409, 425, 429} or (status is not None and status >= 500):
+            return True
+        if status is not None:
+            return False
+    name = type(exc).__name__.casefold()
+    return any(token in name for token in ("timeout", "connection", "network", "rate", "server"))
+
+
+def _retry_delay(attempt_index: int) -> float:
+    """Small exponential backoff with jitter; never blocks longer than 8s."""
+
+    return min(8.0, 1.0 * (2 ** max(0, int(attempt_index))) + random.random() * 0.5)
+
+
 async def gen_response(client, data, schema, temperature, model_name, thinking=None, telemetry=None, reasoning_effort=None):
     configured_tool_choice = str(os.environ.get("TOOL_CHOICE", "required")).lower()
     # DeepSeek thinking mode rejects tool_choice="required".  Keep the
@@ -427,7 +598,7 @@ async def gen_response(client, data, schema, temperature, model_name, thinking=N
         tool_choice = "auto"
     max_output_tokens = int(os.environ.get("MAX_OUTPUT_TOKENS", 4096))
     max_attempts = max(1, int(os.environ.get("MODEL_MAX_ATTEMPTS", 3)))
-    for _ in range(max_attempts):
+    for attempt_index in range(max_attempts):
         try:
             if "gemini" in model_name:
                 if Client is None or types is None:
@@ -449,11 +620,12 @@ async def gen_response(client, data, schema, temperature, model_name, thinking=N
                 for message in data["messages"][2:]:
                     contents.append(message["content"])
                 request_started = time.perf_counter()
-                response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                )
+                async with actor_request_semaphore:
+                    response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
                 _record_actor_usage(telemetry, response, time.perf_counter() - request_started)
                 part_exists = response.candidates[0].content.parts[0]
                 return response
@@ -488,14 +660,23 @@ async def gen_response(client, data, schema, temperature, model_name, thinking=N
                         "chat_template_kwargs": {"enable_thinking": True},
                     }
                 request_started = time.perf_counter()
-                response = await client.chat.completions.create(**request_kwargs)
+                async with actor_request_semaphore:
+                    response = await client.chat.completions.create(**request_kwargs)
                 _record_actor_usage(telemetry, response, time.perf_counter() - request_started)
                 return response
-        
+
         except Exception as e:
-            print(f"[local tool call] failed: {e}")
-            await asyncio.sleep(2)
-    
+            if isinstance(telemetry, dict):
+                telemetry["actor_api_errors"] = telemetry.get("actor_api_errors", 0) + 1
+                if _is_transient_provider_error(e):
+                    telemetry["actor_retries"] = telemetry.get("actor_retries", 0) + int(
+                        attempt_index + 1 < max_attempts
+                    )
+            print(f"[local tool call] failed: {_provider_error_label(e)}")
+            if attempt_index + 1 >= max_attempts or not _is_transient_provider_error(e):
+                break
+            await asyncio.sleep(_retry_delay(attempt_index))
+
     print(f"[local tool call] failed after {max_attempts} attempts; check the model name and API key.")
     raise RuntimeError(f"Local function_call failed after {max_attempts} attempts")
 
@@ -621,7 +802,14 @@ async def rollout(
     rollout_started = time.perf_counter()
 
     try:
-        env = await build_env(data, max_turns, seed=seed, telemetry=telemetry)
+        env = await build_env(
+            data,
+            max_turns,
+            seed=seed,
+            telemetry=telemetry,
+            model_client=client,
+            user_request_limit=user_request_semaphore,
+        )
         while turn < max_turns:
             if "gemini" in model_name:
                 response = await gen_response(
@@ -833,7 +1021,7 @@ async def post_process_results(results, reward_cache, env, pass_k):
 
 
 async def limited_rollout(*args, **kwargs):
-    async with semaphore:
+    async with rollout_semaphore:
         return await rollout(*args, **kwargs)
     
 
@@ -845,7 +1033,7 @@ async def main():
         default=os.getenv("ACTOR_MODEL_NAME") or os.getenv("USER_MODEL_NAME") or "Qwen2.5-7B-Instruct",
     )
     arg_parser.add_argument("--port", type=int, default=8000)
-    arg_parser.add_argument("--max_turns", type=int, default=8)
+    arg_parser.add_argument("--max_turns", type=int, default=25)
     arg_parser.add_argument("--pass_k", type=int, nargs="+", default=[1])
     arg_parser.add_argument("--temperature", type=float, default=1.0)
     arg_parser.add_argument(
@@ -936,7 +1124,7 @@ async def main():
     )
     arg_parser.add_argument(
         "--task-pool",
-        choices=("sft", "grpo", "validation", "validation_smoke"),
+        choices=("sft", "sft_smoke", "grpo", "validation", "validation_smoke"),
         default=None,
         help="Pool selected from --task-pool-manifest (default: sft for Teacher, validation otherwise).",
     )
@@ -945,6 +1133,19 @@ async def main():
         type=int,
         default=None,
         help="Optionally limit each selected environment to the first N manifest tasks.",
+    )
+    arg_parser.add_argument(
+        "--collection-task-limit",
+        type=int,
+        default=(
+            int(os.environ["TEACHER_COLLECTION_TASK_LIMIT"])
+            if os.environ.get("TEACHER_COLLECTION_TASK_LIMIT", "").strip().isdigit()
+            else None
+        ),
+        help=(
+            "SFT collection only: cap the total number of new teacher Task identities "
+            "for a smoke run. Historical tasks are always excluded."
+        ),
     )
     arg_parser.add_argument("--save_name", type=str, default="results")
 
@@ -965,7 +1166,7 @@ async def main():
         args.include_think = True
         args.require_think = True
         args.think_fallback = "omit"
-        args.max_turns = 16
+        args.max_turns = 25
         # ``pass_k`` in legacy evaluator mode means number of samples.  The
         # Teacher protocol is explicit and always two fixed pass indices.
         args.pass_k = [2]
@@ -974,8 +1175,8 @@ async def main():
                 "--sft-collection requires --task-pool-manifest and --task-pool sft; "
                 "build data/task_pools/travel_task_pools.json first"
             )
-        if args.task_pool not in (None, "sft"):
-            raise ValueError("--sft-collection can only use the sft task pool")
+        if args.task_pool not in (None, "sft", "sft_smoke"):
+            raise ValueError("--sft-collection can only use the sft or sft_smoke task pool")
     if is_deepseek_teacher and args.thinking == "enabled":
         args.include_think = True
         args.require_think = True
@@ -994,6 +1195,21 @@ async def main():
 
     print(args)
 
+    # Resolve the public endpoint label once for both dry-run metadata and
+    # real API clients.  Only scheme/host/path are retained; credentials and
+    # query strings never enter manifests or SwanLab config.
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    if not base_url:
+        base_url = (
+            "https://api.openai.com/v1"
+            if "gpt" in args.model_name.lower() and "gpt-oss" not in args.model_name.lower()
+            else f"http://localhost:{args.port}/v1"
+        )
+    api_endpoint_label = (
+        "google-genai" if "gemini" in args.model_name.lower() else public_endpoint_label(base_url)
+    )
+    revision = code_revision()
+
     if args.dry_run:
         client = None
     elif "gemini" in args.model_name.lower():
@@ -1004,16 +1220,8 @@ async def main():
         if AsyncOpenAI is None:
             raise RuntimeError("OpenAI-compatible SDK is not installed; use --dry-run for offline planning")
         # All non-Gemini actors use the OpenAI-compatible Chat Completions
-        # interface.  Prefer an explicitly configured endpoint so remote
-        # providers such as DeepSeek work without model-name heuristics;
-        # otherwise retain the historical local vLLM fallback.
-        base_url = os.environ.get("OPENAI_BASE_URL")
-        if not base_url:
-            base_url = (
-                "https://api.openai.com/v1"
-                if "gpt" in args.model_name.lower() and "gpt-oss" not in args.model_name.lower()
-                else f"http://localhost:{args.port}/v1"
-            )
+        # interface.  The endpoint was resolved above so the exact same safe
+        # label is stored in the collection manifest and tracking run.
         api_key = (
             os.environ.get("OPENAI_API_KEY")
             or os.environ.get("DEEPSEEK_API_KEY")
@@ -1038,6 +1246,8 @@ async def main():
     pool_manifest = None
     pool_name = args.task_pool
     pool_split = "test"
+    collection_source_task_count = None
+    collection_excluded_historical_task_count = 0
     if args.task_pool_manifest:
         pool_name = pool_name or ("sft" if args.sft_collection else "validation")
         pool_manifest_path, pool_manifest, records_by_env, pool_split = load_task_pool_selection(
@@ -1060,6 +1270,44 @@ async def main():
             raise ValueError(
                 "Teacher collection requires a strict active task-pool manifest; "
                 "regenerate it with sft/task_pools.py if an old preview manifest was supplied"
+            )
+        if args.sft_collection:
+            # The formal SFT pool contains the immutable historical seed and
+            # the reserved Teacher expansion.  Only the latter is eligible
+            # for a new paid collection; historical task identities are never
+            # sent to the API again.  This role filter is private metadata and
+            # never enters Actor observations or simulator feedback.
+            pool_records = (pool_manifest.get("pools", {}).get(pool_name, {}) or {}).get("records", [])
+            selected_keys = {
+                (env_name, task_id)
+                for env_name, task_ids in records_by_env.items()
+                for task_id in task_ids
+            }
+            eligible_by_env = {env_name: [] for env_name in SUPPORTED_ENVS}
+            collection_source_task_count = len(selected_keys)
+            for record in pool_records:
+                if not isinstance(record, Mapping):
+                    raise TaskPoolError("SFT pool record must be an object")
+                env_name = str(record.get("env_name", ""))
+                task_id = str(record.get("task_id", ""))
+                if (env_name, task_id) not in selected_keys:
+                    continue
+                role = str(record.get("role", "")).strip()
+                if role == "teacher_expansion":
+                    eligible_by_env.setdefault(env_name, []).append(task_id)
+                elif role == "historical_sft":
+                    collection_excluded_historical_task_count += 1
+                else:
+                    raise TaskPoolError(
+                        f"SFT collection requires an explicit role for {env_name}::{task_id}; "
+                        f"received {role!r}"
+                    )
+            records_by_env = eligible_by_env
+            print(
+                "Teacher collection scope: "
+                f"{collection_source_task_count} pool task(s), "
+                f"{sum(len(values) for values in records_by_env.values())} new Teacher task(s), "
+                f"{collection_excluded_historical_task_count} historical task(s) excluded"
             )
     else:
         test_set_manifest_path, test_set_manifest = load_test_set_manifest(args.test_manifest)
@@ -1087,7 +1335,18 @@ async def main():
         if pool_manifest is None:
             raise ValueError("--sft-collection requires a strict task-pool manifest")
         collection_path = Path(args.collection_cache or f"{args.save_name}_teacher_cache.json")
-        run_id = args.collection_run_id or f"{args.save_name}-teacher"
+        run_id = resolve_collection_run_id(collection_path, args.collection_run_id, args.save_name)
+
+    # A task-pool hash is a label only: task IDs remain in the local manifest
+    # and are never sent to SwanLab.  Derivative smoke manifests carry the
+    # source hash so smoke and full collection phases share one provenance ID.
+    selected_task_pool_hash = stable_json_hash(pool_manifest or test_set_manifest)
+    task_pool_source_hash = (
+        pool_manifest.get("source_manifest_hash")
+        if isinstance(pool_manifest, dict)
+        else None
+    )
+    task_pool_hash = str(task_pool_source_hash or selected_task_pool_hash)
 
     manifest_path = Path(os.environ.get("TRAVEL_MANIFEST_PATH", str(DEFAULT_MANIFEST_PATH)))
     if not manifest_path.is_file():
@@ -1116,6 +1375,12 @@ async def main():
             "seed": args.seed,
             "model_name": args.model_name,
             "max_tasks": args.max_tasks,
+            "collection_task_limit": args.collection_task_limit,
+            "collection_source_task_count": collection_source_task_count,
+            "collection_excluded_historical_task_count": int(collection_excluded_historical_task_count),
+            "rollout_concurrency": int(TEACHER_ROLLOUT_CONCURRENCY),
+            "actor_request_concurrency": int(TEACHER_ACTOR_REQUEST_CONCURRENCY),
+            "user_request_concurrency": int(TEACHER_USER_REQUEST_CONCURRENCY),
             "test_set_manifest_path": str(test_set_manifest_path),
             "test_set_name": selected_set_name,
             "test_task_count": selected_task_count,
@@ -1123,10 +1388,16 @@ async def main():
             "task_pool_manifest_path": str(pool_manifest_path) if pool_manifest_path else None,
             "task_pool_name": pool_name,
             "task_pool_split": pool_split,
+            "task_pool_hash": task_pool_hash,
+            "selected_task_pool_hash": selected_task_pool_hash,
+            "task_pool_source_hash": task_pool_source_hash,
+            "pass_k": 2 if args.sft_collection else max(args.pass_k or [1]),
+            "api_endpoint_label": api_endpoint_label,
+            "collection_run_id": run_id if args.sft_collection else None,
             "tool_schema": function,
             "task_manifest": travel_manifest,
         },
-        code_revision=os.environ.get("CODE_REVISION"),
+        code_revision=revision,
     )
     eval_manifest["task_manifest"] = travel_manifest
     eval_manifest["test_set_manifest_path"] = str(test_set_manifest_path)
@@ -1182,14 +1453,40 @@ async def main():
             model=args.model_name,
             thinking="enabled",
             reasoning_effort="high",
-            max_turns=16,
-            revision=os.environ.get("CODE_REVISION"),
+            max_turns=25,
+            revision=revision,
+            task_pool_hash=task_pool_hash,
+            api_endpoint_label=api_endpoint_label,
         )
         pool_tasks = [
             {"env_name": env_name, "task_id": task_id}
             for env_name in selected_envs
             for task_id in records_by_env.get(env_name, [])
         ]
+        if args.collection_task_limit is not None:
+            if args.collection_task_limit <= 0:
+                raise ValueError("--collection-task-limit must be positive when provided")
+            # A limited smoke run should exercise genuinely new Task
+            # identities instead of silently reusing an earlier paid pass.
+            # Retryable ``error`` records are still eligible; in-flight,
+            # invalid and successful records are already provider attempts.
+            started_task_keys = {
+                str(value.get("provenance", {}).get("task_key"))
+                for value in cache.records.values()
+                if isinstance(value, Mapping)
+                and value.get("status") in {"in_flight", "invalid", "success"}
+                and isinstance(value.get("provenance"), Mapping)
+            }
+            fresh_tasks = [
+                task
+                for task in pool_tasks
+                if f"{task['env_name']}::{task['task_id']}" not in started_task_keys
+            ]
+            pool_tasks = fresh_tasks[: args.collection_task_limit]
+            print(
+                f"Teacher collection limit: selected {len(pool_tasks)} fresh Task(s) "
+                f"from {len(fresh_tasks)} not-yet-started Task(s)"
+            )
         pending = cache.pending(pool_tasks, pass_k=2)
         if args.dry_run:
             print(json.dumps({
@@ -1200,13 +1497,80 @@ async def main():
                 "collection_cache": str(collection_path),
             }, ensure_ascii=False, indent=2))
             return
+
+        collection_tracking = None
+        tracking_config = {
+            "model": args.model_name,
+            "task_pool_hash": task_pool_hash,
+            "pass_k": 2,
+            "thinking": "enabled",
+            "reasoning_effort": "high",
+            "max_turns": int(args.max_turns),
+            "code_revision": revision,
+            "api_endpoint_label": api_endpoint_label,
+            "task_count": len(pool_tasks),
+            "pool_task_count_before_limit": int(collection_source_task_count or len(pool_tasks)),
+            "excluded_historical_task_count": int(collection_excluded_historical_task_count),
+            "collection_task_limit": args.collection_task_limit,
+            "rollout_concurrency": int(TEACHER_ROLLOUT_CONCURRENCY),
+            "actor_request_concurrency": int(TEACHER_ACTOR_REQUEST_CONCURRENCY),
+            "user_request_concurrency": int(TEACHER_USER_REQUEST_CONCURRENCY),
+            "collection_run_id": run_id,
+        }
+        # Use the collection ID as SwanLab's stable run ID.  It is generated
+        # once for a new cache and recovered from the cache on resume, so the
+        # smoke and full phases remain one logical collection run.
+        try:
+            from verl.utils.tracking import Tracking
+
+            previous_swan_id = os.environ.get("SWANLAB_RUN_ID")
+            previous_swan_resume = os.environ.get("SWANLAB_RESUME")
+            previous_swan_tags = os.environ.get("SWANLAB_TAGS")
+            safe_swan_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip("-") or "teacher"
+            os.environ["SWANLAB_RUN_ID"] = safe_swan_id
+            os.environ["SWANLAB_RESUME"] = "allow"
+            os.environ["SWANLAB_TAGS"] = "teacher,thinking-enabled,pass-k-2"
+            try:
+                collection_tracking = Tracking(
+                    project_name="TravelGym",
+                    experiment_name=f"{safe_swan_id}_collection",
+                    default_backend=["swanlab"],
+                    config=tracking_config,
+                )
+            finally:
+                if previous_swan_id is None:
+                    os.environ.pop("SWANLAB_RUN_ID", None)
+                else:
+                    os.environ["SWANLAB_RUN_ID"] = previous_swan_id
+                if previous_swan_resume is None:
+                    os.environ.pop("SWANLAB_RESUME", None)
+                else:
+                    os.environ["SWANLAB_RESUME"] = previous_swan_resume
+                if previous_swan_tags is None:
+                    os.environ.pop("SWANLAB_TAGS", None)
+                else:
+                    os.environ["SWANLAB_TAGS"] = previous_swan_tags
+            collection_tracking.log(
+                {
+                    "collection/task_count": len(pool_tasks),
+                    "collection/pending_passes": len(pending),
+                },
+                step=0,
+            )
+        except Exception as exc:
+            # A monitoring outage must not corrupt the paid-request cache.  The
+            # local collection metadata still records all labels and stats.
+            print(f"SwanLab collection tracking unavailable: {exc}")
+
         # Load each variant once and index by authoritative task ID.  The
         # private ``gold`` field never enters the model messages.
         data_by_task: dict[tuple[str, str], dict[str, Any]] = {}
         for env_name in selected_envs:
             for item in await load_data(env_name, split="train", task_ids=records_by_env.get(env_name, [])):
                 data_by_task[(env_name, str(item["gold"]))] = item
-        for item in pending:
+        async def collect_pending_item(item: dict[str, Any]) -> None:
+            """Collect one claimed pass; the shared semaphore bounds API load."""
+
             env_name, task_id, pass_index = item["env_name"], item["task_id"], int(item["pass_index"])
             provenance = make_provenance(
                 env_name=env_name,
@@ -1216,7 +1580,10 @@ async def main():
                 collection_run_id=run_id,
                 thinking="enabled",
                 reasoning_effort="high",
-                max_turns=16,
+                max_turns=args.max_turns,
+                revision=revision,
+                task_pool_hash=task_pool_hash,
+                api_endpoint_label=api_endpoint_label,
             )
             request_id = cache.claim(
                 env_name=env_name,
@@ -1225,7 +1592,7 @@ async def main():
                 provenance=provenance,
             )
             if not request_id:
-                continue
+                return
             data_item = data_by_task.get((env_name, task_id))
             if data_item is None:
                 cache.record_error(
@@ -1235,11 +1602,11 @@ async def main():
                     error="task_not_loaded",
                     provenance=provenance,
                 )
-                continue
+                return
             started = time.perf_counter()
             try:
                 result = await limited_rollout(
-                    copy.deepcopy(data_item), client, function, args.temperature, 16,
+                    copy.deepcopy(data_item), client, function, args.temperature, args.max_turns,
                     args.model_name, args.thinking, args.seed, True, "omit", True,
                     "high", pass_index, provenance,
                 )
@@ -1270,26 +1637,101 @@ async def main():
                     retryable=False,
                     provenance=provenance,
                 )
+
+        # A queue keeps the endpoint saturated when rollout latencies differ;
+        # a slow pass no longer creates a batch barrier for every other worker.
+        # Claims happen before each paid request and cache writes are atomic,
+        # so queue scheduling does not change pass-level idempotency.
+        pending_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        for item in pending:
+            pending_queue.put_nowait(item)
+        progress_count = 0
+        progress_lock = asyncio.Lock()
+
+        async def collection_worker(worker_index: int) -> None:
+            nonlocal progress_count
+            while True:
+                try:
+                    item = pending_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await collect_pending_item(item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # ``collect_pending_item`` records expected API/rollout
+                    # failures.  Keep a worker alive for an unexpected local
+                    # error so the remaining queue can still drain.
+                    print(
+                        f"Teacher worker {worker_index} failed for "
+                        f"{item.get('task_key')}::{item.get('pass_index')}: "
+                        f"{_provider_error_label(exc)}"
+                    )
+                finally:
+                    pending_queue.task_done()
+                    async with progress_lock:
+                        progress_count += 1
+                        if (
+                            collection_tracking is not None
+                            and (
+                                progress_count % TEACHER_TRACKING_LOG_EVERY == 0
+                                or pending_queue.empty()
+                            )
+                        ):
+                            collection_tracking.log(
+                                {
+                                    "collection/completed_tasks": int(cache.stats.get("completed_tasks", 0)),
+                                    "collection/in_flight_passes": int(cache.stats.get("in_flight_passes", 0)),
+                                    "collection/queue_remaining": int(pending_queue.qsize()),
+                                    "collection/worker_progress": int(progress_count),
+                                },
+                                step=progress_count,
+                            )
+
+        worker_count = min(TEACHER_ROLLOUT_CONCURRENCY, len(pending))
+        workers = [
+            asyncio.create_task(collection_worker(index))
+            for index in range(worker_count)
+        ]
+        try:
+            await pending_queue.join()
+            if workers:
+                await asyncio.gather(*workers)
+        except asyncio.CancelledError:
+            for worker in workers:
+                worker.cancel()
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        pass_stats = summarize_pass_stats(cache.records)
+        collection_metrics = {f"collection/{key}": value for key, value in cache.stats.items()}
+        for pass_index, pass_summary in pass_stats.items():
+            collection_metrics[f"collection/pass_{pass_index}_attempted"] = int(pass_summary["attempted"])
+            collection_metrics[f"collection/pass_{pass_index}_success"] = int(pass_summary["success"])
+            collection_metrics[f"collection/pass_{pass_index}_invalid"] = int(pass_summary["invalid"])
+            collection_metrics[f"collection/pass_{pass_index}_error"] = int(pass_summary["error"])
+            collection_metrics[f"collection/pass_{pass_index}_success_rate"] = float(pass_summary["success_rate"])
+        tracking_payload = {
+            **tracking_config,
+            "stats": cache.stats,
+            "pass_stats": pass_stats,
+            **collection_metrics,
+        }
         atomic_json_dump(
             f"{PROJECT_ROOT}/{args.save_name}_collection_tracking.json",
-            {f"collection/{key}": value for key, value in cache.stats.items()},
+            tracking_payload,
         )
-        # Collection metrics are scalar-only.  SwanLab is optional in the
-        # offline environment; a missing client never invalidates the private
-        # cache, and no transcript/reasoning/labels are sent to the backend.
-        try:
-            from verl.utils.tracking import Tracking
-            collection_tracking = Tracking(
-                project_name="TravelGym",
-                experiment_name=f"{run_id}_collection",
-                default_backend=["swanlab"],
-                config={"model": args.model_name, "thinking": "enabled", "reasoning_effort": "high", "max_turns": 16},
-            )
-            collection_tracking.log({f"collection/{key}": value for key, value in cache.stats.items()}, step=int(cache.stats.get("completed_tasks", 0)))
-            collection_tracking.finish()
-        except Exception as exc:
-            print(f"SwanLab collection tracking unavailable: {exc}")
-        print(json.dumps({f"collection/{key}": value for key, value in cache.stats.items()}, ensure_ascii=False, indent=2))
+        # Collection metrics are scalar-only.  SwanLab receives labels at init
+        # and aggregate counters here; cache transcripts/reasoning/private IDs
+        # remain local.
+        if collection_tracking is not None:
+            try:
+                collection_tracking.log(collection_metrics, step=int(cache.stats.get("completed_tasks", 0)))
+                collection_tracking.finish()
+            except Exception as exc:
+                print(f"SwanLab collection tracking finish unavailable: {exc}")
+        print(json.dumps(tracking_payload, ensure_ascii=False, indent=2))
         return
 
     for env in args.envs:

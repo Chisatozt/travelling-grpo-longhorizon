@@ -8,6 +8,17 @@
   "sft_target_count": 600,
   "sft_historical_count": 238,
   "sft_expansion_count": 362,
+  "sft_smoke_size": 20,
+  "sft_smoke_quotas": {
+    "travel22": 3,
+    "travel33": 3,
+    "travel44": 3,
+    "travel233": 3,
+    "travel333": 2,
+    "travel334": 2,
+    "travel444": 2,
+    "travel2222": 2
+  },
   "validation_size": 200,
   "smoke_size": 20,
   "strict_task_identity": true,
@@ -90,37 +101,43 @@
       "record_index": 97,
       "opaque_task_key": "opaque_sft::3089e2f523836fc496c257b8c66bff348ac3d33016bef110c646a2bf9eaf81da",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 144,
       "opaque_task_key": "opaque_sft::d829e87bfd541fa31e31488fd44e5974e04eecc0e54861f2fae1e8ca1762e8df",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 159,
       "opaque_task_key": "opaque_sft::e131d0e49687a89cafc50b97622c92ffc0507db6083bf7acae53e75665676482",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 180,
       "opaque_task_key": "opaque_sft::78fd3e30451e68f21a334b6503a21964c1fc9d048750f99b2be880c01979ca4c",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 206,
       "opaque_task_key": "opaque_sft::1c44e2e96b9457c21b7c803053dab33391baee47ba23bb612881fcca404a2482",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 208,
       "opaque_task_key": "opaque_sft::e70679e080acdfd71efab4969b8f6d03185fcfa040a3fba6b55a32d5b78d563d",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     }
   ],
   "quarantined_sft": [
@@ -128,37 +145,43 @@
       "record_index": 97,
       "opaque_task_key": "opaque_sft::3089e2f523836fc496c257b8c66bff348ac3d33016bef110c646a2bf9eaf81da",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 144,
       "opaque_task_key": "opaque_sft::d829e87bfd541fa31e31488fd44e5974e04eecc0e54861f2fae1e8ca1762e8df",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 159,
       "opaque_task_key": "opaque_sft::e131d0e49687a89cafc50b97622c92ffc0507db6083bf7acae53e75665676482",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 180,
       "opaque_task_key": "opaque_sft::78fd3e30451e68f21a334b6503a21964c1fc9d048750f99b2be880c01979ca4c",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 206,
       "opaque_task_key": "opaque_sft::1c44e2e96b9457c21b7c803053dab33391baee47ba23bb612881fcca404a2482",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     },
     {
       "record_index": 208,
       "opaque_task_key": "opaque_sft::e70679e080acdfd71efab4969b8f6d03185fcfa040a3fba6b55a32d5b78d563d",
       "source_path": "sft/travel_sft_public.json",
-      "reason": "task_id_unresolved_or_not_in_inventory"
+      "reason": "explicit_opaque_quarantine",
+      "status": "discarded"
     }
   ],
   "quarantined_sft_count": 6,
@@ -5567,6 +5590,194 @@
           "task_key": "travel2222::flight:2-90|apartment:2-38|rental_car:2-25|restaurant:2-76",
           "split": "train",
           "source_index": 16,
+          "source_path": "data/travel2222_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        }
+      ]
+    },
+    "sft_smoke": {
+      "pool": "sft_smoke",
+      "parent_pool": "sft",
+      "split": "train",
+      "purpose": "20-task stratified smoke collection for DeepSeek Teacher",
+      "records": [
+        {
+          "env_name": "travel22",
+          "task_id": "flight:2-31|rental_car:2-54",
+          "task_key": "travel22::flight:2-31|rental_car:2-54",
+          "split": "train",
+          "source_index": 121,
+          "source_path": "data/travel22_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel22",
+          "task_id": "hotel:2-69|rental_car:2-21",
+          "task_key": "travel22::hotel:2-69|rental_car:2-21",
+          "split": "train",
+          "source_index": 170,
+          "source_path": "data/travel22_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel22",
+          "task_id": "rental_car:2-29|restaurant:2-84",
+          "task_key": "travel22::rental_car:2-29|restaurant:2-84",
+          "split": "train",
+          "source_index": 263,
+          "source_path": "data/travel22_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel33",
+          "task_id": "rental_car:3-153|restaurant:3-343",
+          "task_key": "travel33::rental_car:3-153|restaurant:3-343",
+          "split": "train",
+          "source_index": 326,
+          "source_path": "data/travel33_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel33",
+          "task_id": "hotel:3-116|rental_car:3-159",
+          "task_key": "travel33::hotel:3-116|rental_car:3-159",
+          "split": "train",
+          "source_index": 187,
+          "source_path": "data/travel33_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel33",
+          "task_id": "apartment:3-138|restaurant:3-87",
+          "task_key": "travel33::apartment:3-138|restaurant:3-87",
+          "split": "train",
+          "source_index": 243,
+          "source_path": "data/travel33_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel44",
+          "task_id": "flight:4-293|apartment:4-111",
+          "task_key": "travel44::flight:4-293|apartment:4-111",
+          "split": "train",
+          "source_index": 16,
+          "source_path": "data/travel44_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel44",
+          "task_id": "apartment:4-233|restaurant:4-222",
+          "task_key": "travel44::apartment:4-233|restaurant:4-222",
+          "split": "train",
+          "source_index": 110,
+          "source_path": "data/travel44_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel44",
+          "task_id": "apartment:4-131|rental_car:4-35",
+          "task_key": "travel44::apartment:4-131|rental_car:4-35",
+          "split": "train",
+          "source_index": 21,
+          "source_path": "data/travel44_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel233",
+          "task_id": "flight:3-243|apartment:3-172|restaurant:2-76",
+          "task_key": "travel233::flight:3-243|apartment:3-172|restaurant:2-76",
+          "split": "train",
+          "source_index": 288,
+          "source_path": "data/travel233_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel233",
+          "task_id": "hotel:2-20|rental_car:3-45|restaurant:3-317",
+          "task_key": "travel233::hotel:2-20|rental_car:3-45|restaurant:3-317",
+          "split": "train",
+          "source_index": 137,
+          "source_path": "data/travel233_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel233",
+          "task_id": "flight:2-39|rental_car:3-12|restaurant:3-173",
+          "task_key": "travel233::flight:2-39|rental_car:3-12|restaurant:3-173",
+          "split": "train",
+          "source_index": 98,
+          "source_path": "data/travel233_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel333",
+          "task_id": "flight:3-102|rental_car:3-5|restaurant:3-135",
+          "task_key": "travel333::flight:3-102|rental_car:3-5|restaurant:3-135",
+          "split": "train",
+          "source_index": 280,
+          "source_path": "data/travel333_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel333",
+          "task_id": "flight:3-222|rental_car:3-80|restaurant:3-126",
+          "task_key": "travel333::flight:3-222|rental_car:3-80|restaurant:3-126",
+          "split": "train",
+          "source_index": 285,
+          "source_path": "data/travel333_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel334",
+          "task_id": "hotel:3-61|rental_car:3-135|restaurant:4-257",
+          "task_key": "travel334::hotel:3-61|rental_car:3-135|restaurant:4-257",
+          "split": "train",
+          "source_index": 97,
+          "source_path": "data/travel334_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel334",
+          "task_id": "flight:3-40|rental_car:4-153|restaurant:3-251",
+          "task_key": "travel334::flight:3-40|rental_car:4-153|restaurant:3-251",
+          "split": "train",
+          "source_index": 215,
+          "source_path": "data/travel334_multiturn_onechoice/train.parquet",
+          "role": "historical_sft"
+        },
+        {
+          "env_name": "travel444",
+          "task_id": "flight:4-465|apartment:4-111|restaurant:4-253",
+          "task_key": "travel444::flight:4-465|apartment:4-111|restaurant:4-253",
+          "split": "train",
+          "source_index": 167,
+          "source_path": "data/travel444_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel444",
+          "task_id": "apartment:4-204|rental_car:4-31|restaurant:4-13",
+          "task_key": "travel444::apartment:4-204|rental_car:4-31|restaurant:4-13",
+          "split": "train",
+          "source_index": 183,
+          "source_path": "data/travel444_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel2222",
+          "task_id": "flight:2-31|hotel:2-10|rental_car:2-30|restaurant:2-123",
+          "task_key": "travel2222::flight:2-31|hotel:2-10|rental_car:2-30|restaurant:2-123",
+          "split": "train",
+          "source_index": 52,
+          "source_path": "data/travel2222_multiturn_onechoice/train.parquet",
+          "role": "teacher_expansion"
+        },
+        {
+          "env_name": "travel2222",
+          "task_id": "flight:2-29|hotel:2-20|rental_car:2-37|restaurant:2-94",
+          "task_key": "travel2222::flight:2-29|hotel:2-20|rental_car:2-37|restaurant:2-94",
+          "split": "train",
+          "source_index": 20,
           "source_path": "data/travel2222_multiturn_onechoice/train.parquet",
           "role": "teacher_expansion"
         }
@@ -23770,6 +23981,7 @@
   },
   "pool_task_counts": {
     "sft": 600,
+    "sft_smoke": 20,
     "grpo": 2051,
     "validation": 200,
     "validation_smoke": 20

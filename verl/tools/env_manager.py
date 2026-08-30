@@ -63,7 +63,7 @@ class EnvironmentManager:
         import travelgym
 
         env_config = travelgym.get_default_config()
-        env_config.max_steps = int(kwargs.get("max_turns", 20))
+        env_config.max_steps = int(kwargs.get("max_turns", 25))
         env_config.data_mode = "single"
         scenario_id = kwargs.get("id")
         if scenario_id is not None:

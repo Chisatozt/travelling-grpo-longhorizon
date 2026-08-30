@@ -40,6 +40,7 @@ use_remove_padding: true
 trainer:
   project_name: TravelGym
   experiment_name: qwen35_4b_canonical_sft
+  total_epochs: 3
   logger: ['console', 'swanlab']
   validation_frequency: epoch
   save_each_epoch: true

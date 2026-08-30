@@ -9,6 +9,7 @@ can resume without billing a completed pass again.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -33,7 +34,14 @@ def teacher_pass_key(env_name: str, task_id: str, pass_index: int) -> str:
 
 
 def code_revision(default: str = "unknown") -> str:
-    """Return a short immutable code revision without failing offline runs."""
+    """Return an immutable code revision without requiring a Git checkout.
+
+    Collection runs are often executed from an exported workspace rather than
+    a Git worktree.  In that case we derive a short content hash from the
+    source files that define collection, TravelGym, and SFT canonicalisation.
+    This keeps the SwanLab label useful while avoiding any secret or machine
+    specific values.
+    """
 
     value = os.environ.get("CODE_REVISION")
     if value:
@@ -50,7 +58,30 @@ def code_revision(default: str = "unknown") -> str:
             return result.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
-    return default
+
+    # The repository may intentionally not contain ``.git`` (for example when
+    # copied to a training server).  Hash only source files relevant to the
+    # trajectory pipeline; generated caches, datasets, and credentials are
+    # deliberately excluded.
+    root = Path(__file__).resolve().parents[1]
+    source_roots = ("eval", "sft", "gyms", "verl")
+    source_files = []
+    for relative_root in source_roots:
+        candidate = root / relative_root
+        if candidate.is_dir():
+            source_files.extend(path for path in candidate.rglob("*.py") if path.is_file())
+    if not source_files:
+        return default
+    digest = hashlib.sha256()
+    for path in sorted(source_files):
+        try:
+            relative = path.relative_to(root).as_posix().encode("utf-8")
+            digest.update(relative + b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        except OSError:
+            continue
+    return f"workspace-{digest.hexdigest()[:16]}"
 
 
 def make_provenance(
@@ -62,12 +93,14 @@ def make_provenance(
     collection_run_id: str,
     thinking: str = "enabled",
     reasoning_effort: str = "high",
-    max_turns: int = 16,
+    max_turns: int = 25,
     revision: str | None = None,
+    task_pool_hash: str | None = None,
+    api_endpoint_label: str | None = None,
 ) -> dict[str, Any]:
     """Build private cache provenance; never put this object in Actor context."""
 
-    return {
+    result: dict[str, Any] = {
         "task_key": f"{str(env_name).strip()}::{str(task_id).strip()}",
         "env_name": str(env_name).strip(),
         "task_id": str(task_id).strip(),
@@ -79,6 +112,11 @@ def make_provenance(
         "code_revision": revision or code_revision(),
         "collection_run_id": str(collection_run_id),
     }
+    if task_pool_hash:
+        result["task_pool_hash"] = str(task_pool_hash)
+    if api_endpoint_label:
+        result["api_endpoint_label"] = str(api_endpoint_label)
+    return result
 
 
 def sanitize_tracking_payload(payload: Any) -> Any:
@@ -140,8 +178,10 @@ class TeacherCache:
     model: str = "unknown"
     thinking: str = "enabled"
     reasoning_effort: str = "high"
-    max_turns: int = 16
+    max_turns: int = 25
     revision: str | None = None
+    task_pool_hash: str | None = None
+    api_endpoint_label: str | None = None
 
     SCHEMA_VERSION = "travelgym-teacher-cache-v1"
 
@@ -174,6 +214,8 @@ class TeacherCache:
             reasoning_effort=self.reasoning_effort,
             max_turns=self.max_turns,
             revision=self.revision,
+            task_pool_hash=self.task_pool_hash,
+            api_endpoint_label=self.api_endpoint_label,
         )
 
     def _load(self) -> None:
@@ -218,6 +260,8 @@ class TeacherCache:
                     raise TeacherCacheError(f"teacher cache env_name mismatch: {key}")
                 if provenance.get("task_id") not in (None, "", task_id):
                     raise TeacherCacheError(f"teacher cache task_id mismatch: {key}")
+                if self.task_pool_hash and provenance.get("task_pool_hash") not in (None, "", self.task_pool_hash):
+                    raise TeacherCacheError(f"teacher cache task-pool hash mismatch: {key}")
                 loaded[key] = dict(raw_value)
             self.records = loaded
         if isinstance(payload.get("stats"), Mapping):
@@ -430,11 +474,49 @@ class TeacherCache:
         )
 
 
+def summarize_pass_stats(records: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return pass-indexed success/invalid/error counts for collection reports."""
+
+    summary: dict[str, dict[str, Any]] = {}
+    for pass_index in (0, 1):
+        counts = {
+            "attempted": 0,
+            "success": 0,
+            "invalid": 0,
+            "error": 0,
+            "in_flight": 0,
+        }
+        for value in records.values():
+            if not isinstance(value, Mapping):
+                continue
+            provenance = value.get("provenance", {})
+            if not isinstance(provenance, Mapping):
+                continue
+            try:
+                current_pass = int(provenance.get("pass_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if current_pass != pass_index:
+                continue
+            status = str(value.get("status", "error"))
+            if status not in counts:
+                status = "error"
+            counts[status] += 1
+            counts["attempted"] += 1
+        counts["success_rate"] = (
+            float(counts["success"]) / float(counts["attempted"])
+            if counts["attempted"] else 0.0
+        )
+        summary[str(pass_index)] = counts
+    return summary
+
+
 __all__ = [
     "TeacherCache",
     "TeacherCacheError",
     "code_revision",
     "make_provenance",
     "sanitize_tracking_payload",
+    "summarize_pass_stats",
     "teacher_pass_key",
 ]

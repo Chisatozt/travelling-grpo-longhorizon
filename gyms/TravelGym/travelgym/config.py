@@ -42,7 +42,8 @@ class TravelGymConfig:
     timeout: float = 15.0
     
     # Environment configuration
-    max_steps: int = 20
+    # The public training/evaluation contract uses one long-horizon budget.
+    max_steps: int = 25
     search_failure_interval: int = 5 # every N times of search will yeild an system error on purpose
     elicitation_interval: int = 3 # will proactively elicit a preference if the conversation is off topic for N times consecutively
     
@@ -155,7 +156,7 @@ def get_demo_config() -> TravelGymConfig:
     """Get a demonstration configuration with verbose output."""
     return TravelGymConfig(
         verbose=True,
-        max_steps=15,
+        max_steps=25,
         temperature=0.5,
         track_conversation_history=True,
         track_preference_states=True,

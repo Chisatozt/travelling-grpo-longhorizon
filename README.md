@@ -132,7 +132,7 @@ python .\eval\eval.py --model_name deepseek-v4-flash --sft-collection `
   --thinking enabled --include-think --require-think `
   --task-pool-manifest .\data\task_pools\travel_task_pools.json `
   --task-pool sft `
-  --max_turns 16 --save_name outputs/deepseek_teacher_sft
+  --max_turns 25 --save_name outputs/deepseek_teacher_sft
 python .\sft\merge_travel_sft.py `
   --base .\sft\travel_sft_public.json `
   --input .\eval\outputs\deepseek_teacher_sft_teacher_cache.json `
@@ -163,6 +163,7 @@ python -m verl.trainer.fsdp_sft_trainer \
 - **Algorithm**: GRPO with terminal-only TravelGym reward
 - **Turn-Level Credit**: disabled by default; enable only through `off -> shadow -> train` after conservation checks
 - **Trajectory Scoring**: terminal scalar (no per-step reward averaging)
+- **Dynamic Resampling**: bounded dynamic resampling enabled by default; the Hard Case Pool remains audit-only
 - **Hard Case Pool**: trainer-private, append-only audit of three consecutive valid all-zero rollout groups; no resampling or training injection
 
 **Training Configuration Example:**
@@ -170,11 +171,16 @@ python -m verl.trainer.fsdp_sft_trainer \
 ```yaml
 # Key hyperparameters in train.sh
 algorithm.adv_estimator: grpo_multiturn
-algorithm.gamma: 1.0
-data.train_batch_size: 128
+algorithm.gamma: 0.8
+algorithm.dynamic_sampling.enable: true
+data.train_batch_size: 8
+actor_rollout_ref.actor.ppo_mini_batch_size: 4
+actor_rollout_ref.rollout.n: 4
+actor_rollout_ref.rollout.multi_turn.max_turns: 25
 actor_rollout_ref.rollout.multi_turn.turn_level_method: "off"
 actor_rollout_ref.rollout.multi_turn.trajectory_score_method: "Terminal"
 algorithm.turn_credit_stage: off
+trainer.save_freq: 20
 ```
 
 ### 3. Model Evaluation
@@ -253,7 +259,7 @@ UserRL provides comprehensive logging through:
 ```yaml
 trainer.logger: ['console', 'swanlab']
 trainer.project_name: 'TravelGym'
-trainer.save_freq: 1
+trainer.save_freq: 20
 trainer.test_freq: 5
 ```
 

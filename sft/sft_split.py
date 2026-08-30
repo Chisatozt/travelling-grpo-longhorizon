@@ -15,15 +15,21 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 try:
-    from .task_pools import TaskPoolError, load_pool_manifest, pool_task_keys
+    from .task_pools import TASK_POOL_SELECTION_SEED, TaskPoolError, load_pool_manifest, pool_task_keys
     from .clean_travel_trajectories import is_sft_eligible
 except ImportError:  # direct script execution
-    from task_pools import TaskPoolError, load_pool_manifest, pool_task_keys
+    from task_pools import TASK_POOL_SELECTION_SEED, TaskPoolError, load_pool_manifest, pool_task_keys
     from clean_travel_trajectories import is_sft_eligible
 
 
 class SFTSplitError(ValueError):
     pass
+
+
+# Keep gold10 selection aligned with the deterministic task-pool seed.  The
+# seed is written to split_manifest.json so a later merge cannot silently
+# change the validation task groups.
+SFT_SPLIT_SELECTION_SEED = TASK_POOL_SELECTION_SEED
 
 
 def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -85,6 +91,7 @@ def select_validation_tasks(
     count: int = 10,
     token_length_fn: Callable[[Mapping[str, Any]], int] | None = None,
     required_envs: Iterable[str] | None = None,
+    selection_seed: int = SFT_SPLIT_SELECTION_SEED,
 ) -> tuple[list[str], dict[str, Any]]:
     """Select exactly ``count`` strict_gold task groups deterministically."""
 
@@ -114,7 +121,7 @@ def select_validation_tasks(
     # First guarantee all eight environment variants.  A stable hash, rather
     # than source order, keeps the split reproducible after cache merging.
     for env in required:
-        candidates = sorted(env_groups[env], key=lambda key: _hash(("env", env, key)))
+        candidates = sorted(env_groups[env], key=lambda key: _hash(("env", selection_seed, env, key)))
         selected.append(candidates[0])
     if len(selected) > count:
         raise SFTSplitError(f"validation count {count} is smaller than required environments {len(selected)}")
@@ -130,12 +137,12 @@ def select_validation_tasks(
             key for key in remaining
             if _length_bucket(max(lengths[i] for i in groups[key]), all_group_lengths) == bucket
         ]
-        candidate = min(bucket_candidates, key=lambda key: _hash(("bucket", bucket, key))) if bucket_candidates else None
+        candidate = min(bucket_candidates, key=lambda key: _hash(("bucket", selection_seed, bucket, key))) if bucket_candidates else None
         if candidate:
             selected.append(candidate)
             remaining.remove(candidate)
             buckets.add(bucket)
-    for key in sorted(remaining, key=lambda value: _hash(("extra", value))):
+    for key in sorted(remaining, key=lambda value: _hash(("extra", selection_seed, value))):
         if len(selected) >= count:
             break
         selected.append(key)
@@ -144,6 +151,7 @@ def select_validation_tasks(
     selected = sorted(selected, key=lambda key: (_env_from_task_key(key), _hash(key)))
     return selected, {
         "required_envs": required,
+        "selection_seed": int(selection_seed),
         "selected_task_keys": selected,
         "selected_envs": sorted({_env_from_task_key(key) for key in selected}),
         "length_buckets": {
@@ -165,6 +173,7 @@ def build_sft_split(
     token_length_fn: Callable[[Mapping[str, Any]], int] | None = None,
     require_exact_token_audit: bool = True,
     validation_count: int = 10,
+    selection_seed: int = SFT_SPLIT_SELECTION_SEED,
 ) -> dict[str, Any]:
     """Write train/val JSONL plus a private split manifest."""
 
@@ -208,7 +217,13 @@ def build_sft_split(
                 f"{preview}"
             )
 
-    selected, selection_meta = select_validation_tasks(records, audits, count=validation_count, token_length_fn=token_length_fn)
+    selected, selection_meta = select_validation_tasks(
+        records,
+        audits,
+        count=validation_count,
+        token_length_fn=token_length_fn,
+        selection_seed=selection_seed,
+    )
     val_keys = set(selected)
     if sft_pool_keys is not None and not val_keys <= sft_pool_keys:
         raise SFTSplitError("validation task selection escaped the formal SFT pool")
@@ -235,6 +250,7 @@ def build_sft_split(
         "tokenizer": tokenizer_name,
         "token_audit_exact": bool(tokenizer_name or token_length_fn),
         "validation_count": int(validation_count),
+        "selection_seed": int(selection_seed),
         "selected_task_keys": selected,
         "train_record_count": len(train),
         "validation_record_count": len(validation),
@@ -261,6 +277,7 @@ def main() -> None:
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--task-pool-manifest", type=Path, default=None)
     parser.add_argument("--max-length", type=int, default=32768)
+    parser.add_argument("--selection-seed", type=int, default=SFT_SPLIT_SELECTION_SEED)
     args = parser.parse_args()
     records = _read_jsonl(args.input)
     audit_payload = json.loads(args.audit.read_text(encoding="utf-8"))
@@ -268,7 +285,15 @@ def main() -> None:
     if not isinstance(audits, list):
         raise SFTSplitError("audit must contain a records list")
     pool = load_pool_manifest(args.task_pool_manifest, require_strict=True) if args.task_pool_manifest else None
-    manifest = build_sft_split(records, audits, output_dir=args.output_dir, task_pool_manifest=pool, tokenizer_name=args.tokenizer, max_length=args.max_length)
+    manifest = build_sft_split(
+        records,
+        audits,
+        output_dir=args.output_dir,
+        task_pool_manifest=pool,
+        tokenizer_name=args.tokenizer,
+        max_length=args.max_length,
+        selection_seed=args.selection_seed,
+    )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 

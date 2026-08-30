@@ -90,7 +90,7 @@ End the current episode:
 from travelgym import TravelGymConfig
 
 config = TravelGymConfig(
-    max_steps=20,
+    max_steps=25,
     verbose=True,
     data_mode="random",
     reward_version="travelgym-terminal-v1",
@@ -104,7 +104,7 @@ env = TravelEnv(config)
 
 | Parameter | Description | Default | Options |
 |-----------|-------------|---------|---------|
-| `max_steps` | Maximum steps per episode | `20` | Any positive integer |
+| `max_steps` | Maximum steps per episode | `25` | Any positive integer |
 | `verbose` | Enable verbose logging | `False` | `True`/`False` |
 | `data_mode` | Scenario selection mode | `"random"` | `"random"`, `"single"`, `"list"` |
 | `data_source` | Specific scenario to use | `"random"` | Scenario key string or list |

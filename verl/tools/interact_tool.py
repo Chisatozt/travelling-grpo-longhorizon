@@ -26,7 +26,7 @@ class InteractTool(BaseTool):
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         return self.tool_schema
 
-    async def create(self, instance_id: str, env_name: Optional[str] = TRAVEL_GYM_NAME, max_turns: int = 15, **kwargs) -> str:
+    async def create(self, instance_id: str, env_name: Optional[str] = TRAVEL_GYM_NAME, max_turns: int = 25, **kwargs) -> str:
         """Create a TravelGym instance and initialize conversation state.
         
         Args:

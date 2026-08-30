@@ -7,6 +7,7 @@ deterministic partition used by the training/evaluation code.  A task key is
 | Pool | Source | Use |
 | --- | --- | --- |
 | `sft` | 238 resolvable historical tasks + 362 deterministic train-task reservations | historical SFT and DeepSeek Teacher collection |
+| `sft_smoke` | stratified 20-task subset of `sft` | paid DeepSeek Teacher smoke collection |
 | `grpo` | train tasks not in `sft` | Actor rollout during GRPO |
 | `validation` | fixed 200-task test selection | final validation |
 | `validation_smoke` | fixed 20-task subset of `validation` | quick validation |

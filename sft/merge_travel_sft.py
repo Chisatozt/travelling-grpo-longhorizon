@@ -27,8 +27,9 @@ import hashlib
 import json
 import math
 import statistics
+from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from .travel_canonical import (
@@ -361,6 +362,7 @@ def build_manifest(
     tokenizer_name: str | None = None,
     max_length: int = 32768,
     duplicate_count: int = 0,
+    source_stats: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     lengths, unit, supervised_token_counts, template_metadata = _token_lengths(records, tokenizer_name)
     overlength = 0
@@ -377,9 +379,22 @@ def build_manifest(
         else:
             effective_lengths.append(length)
     by_class: dict[str, dict[str, int]] = {}
+    source_distribution: Counter[str] = Counter()
     for index, record in enumerate(records):
         metadata = record.get("trainer_metadata", {})
         category = str(metadata.get("trajectory_class", "unknown"))
+        audit = audits[index] if index < len(audits) else {}
+        source_path = str(audit.get("source_path", ""))
+        source_name = Path(source_path).name.lower()
+        if source_name == "travel_sft_public.json":
+            source_label = "historical_public"
+        elif "teacher" in source_name or "cache" in source_name:
+            source_label = "deepseek_teacher"
+        elif source_name:
+            source_label = source_name
+        else:
+            source_label = "unknown"
+        source_distribution[source_label] += 1
         structural_count = int(sum(1 for value in record.get("assistant_train_mask", []) if value))
         exact_count = (
             int(supervised_token_counts[index])
@@ -394,6 +409,34 @@ def build_manifest(
         item["supervised_message_turns"] += structural_count
         if exact_count is not None:
             item["effective_supervised_tokens"] += exact_count
+    effective_supervised_tokens = (
+        int(sum(supervised_token_counts)) if supervised_token_counts is not None else None
+    )
+    eligible_classes = {"strict_gold", "recoverable_correct", "partial_correct"}
+    eligible_effective_supervised_tokens = (
+        int(
+            sum(
+                int(supervised_token_counts[index])
+                for index, record in enumerate(records)
+                if index < len(supervised_token_counts)
+                and str(record.get("trainer_metadata", {}).get("trajectory_class", ""))
+                in eligible_classes
+            )
+        )
+        if supervised_token_counts is not None
+        else None
+    )
+    exclusion_reasons: Counter[str] = Counter()
+    for category in ("totally_wrong", "infrastructure_invalid", "overlength_quarantine"):
+        count = int(by_class.get(category, {}).get("records", 0))
+        if count:
+            exclusion_reasons[category] += count
+    if source_stats:
+        for stats in source_stats.values():
+            if not isinstance(stats, Mapping):
+                continue
+            for reason in ("nontravel_dropped", "opaque_quarantined"):
+                exclusion_reasons[reason] += int(stats.get(reason, 0) or 0)
     return {
         "schema_version": SCHEMA_VERSION,
         "template": template_metadata,
@@ -411,6 +454,10 @@ def build_manifest(
         "overlength_count": overlength,
         "duplicate_count": duplicate_count,
         "classification": by_class,
+        "source_distribution": dict(sorted(source_distribution.items())),
+        "effective_supervised_tokens": effective_supervised_tokens,
+        "eligible_effective_supervised_tokens": eligible_effective_supervised_tokens,
+        "exclusion_reasons": dict(sorted(exclusion_reasons.items())),
         "note": (
             "effective_supervised_tokens is exact only when --tokenizer is supplied; "
             "otherwise supervised_message_turns is a structural count."
@@ -559,7 +606,14 @@ def main() -> None:
     ):
         if candidate is not None and candidate.resolve() in source_paths:
             raise ValueError(f"refusing to overwrite the source SFT corpus via {label} output")
-    manifest = build_manifest(merged, merged_audits, tokenizer_name=args.tokenizer, max_length=args.max_length, duplicate_count=duplicate_count)
+    manifest = build_manifest(
+        merged,
+        merged_audits,
+        tokenizer_name=args.tokenizer,
+        max_length=args.max_length,
+        duplicate_count=duplicate_count,
+        source_stats={"historical_public": base_stats, "deepseek_teacher": new_stats},
+    )
     if args.task_pool_manifest:
         manifest["task_pool_manifest"] = str(Path(args.task_pool_manifest).resolve())
     # ``build_manifest`` may quarantine overlength rows and updates the

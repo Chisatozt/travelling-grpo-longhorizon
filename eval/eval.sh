@@ -20,7 +20,7 @@ TRAVEL_TEST_MANIFEST="${TRAVEL_TEST_MANIFEST:-$SCRIPT_DIR/test_manifests/final20
 
 python eval.py \
     --model_name "$ACTOR_MODEL_NAME" \
-    --max_turns 16 \
+    --max_turns 25 \
     --pass_k 1 \
     --temperature 0 \
     --envs "${TRAVEL_ENVS[@]}" \
@@ -33,7 +33,7 @@ if [[ -n "${CUSTOMIZED_SERVED_MODEL_NAME:-}" ]]; then
     python eval.py \
         --model_name "$CUSTOMIZED_SERVED_MODEL_NAME" \
         --port "${CUSTOMIZED_SERVED_MODEL_PORT:-8500}" \
-        --max_turns 16 \
+        --max_turns 25 \
         --pass_k 1 \
         --temperature 0 \
         --envs "${TRAVEL_ENVS[@]}" \

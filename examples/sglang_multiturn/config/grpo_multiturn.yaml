@@ -7,6 +7,12 @@ defaults:
   - _self_
 
 data:
+  # The GRPO pool is the eligible sampling universe, not a coverage target.
+  # With train_batch_size=8 and 200 steps, the deterministic shuffled sampler
+  # consumes 1600 task draws from this pool without requiring a full pass.
+  train_batch_size: 8
+  seed: 20260801
+  shuffle: true
   # The loader filters the aggregate parquet by the disjoint GRPO pool before
   # tokenisation.  Validation uses the same manifest's 200-task pool.
   task_pool_manifest: data/task_pools/travel_task_pools.json
@@ -21,12 +27,10 @@ algorithm:
   # until conservation checks have passed in shadow mode.
   action_credit_ratio: 0.8
   turn_credit_stage: "off"
-  # Keep rollout sampling fixed for the current experiment.  The Hard Case
-  # Pool below is audit-only and must not trigger retries, resampling, or
-  # sampler injection.  Bounded dynamic sampling remains available only as an
-  # explicit future experiment override.
+  # Enable bounded dynamic resampling for GRPO.  The Hard Case Pool below is
+  # still audit-only and must not trigger retries or sampler injection.
   dynamic_sampling:
-    enable: false
+    enable: true
     max_generation_batches: 3
     max_consecutive_skips: 10
     reward_tolerance: 1.0e-6
@@ -60,7 +64,7 @@ actor_rollout_ref:
     max_model_len: 32768
     multi_turn:
       enable: True
-      max_turns: 16
+      max_turns: 25
       model_name: gpt-4o
       turn_level_method: "off"
       trajectory_score_method: Terminal
@@ -82,4 +86,5 @@ trainer:
   total_training_steps: 200
   run_until_step: null
   milestones: [5, 50, 100, 150, 200]
+  save_freq: 20
   wait_for_selected_grpo_checkpoint: true

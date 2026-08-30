@@ -8,6 +8,7 @@
 pandas>=2.1
 pyarrow>=19.0.0
 datasets>=2.18
+transformers>=4.45,<5
 python-dotenv>=1.0,<2
 swanlab>=0.9.8,<1.0
 

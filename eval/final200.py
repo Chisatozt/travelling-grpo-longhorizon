@@ -311,7 +311,7 @@ def main() -> None:
     parser.add_argument("--grpo", default=None)
     parser.add_argument("--deepseek", required=True)
     parser.add_argument("--seed", type=int, default=20260801)
-    parser.add_argument("--max-turns", type=int, default=16)
+    parser.add_argument("--max-turns", type=int, default=25)
     parser.add_argument("--selected-grpo-checkpoint", default=None)
     parser.add_argument("--output", type=Path, default=Path("final200_plan.json"))
     parser.add_argument("--dry-run", action="store_true")

@@ -12,7 +12,7 @@
         "model": "deepseek-v4-flash",
         "thinking": "enabled",
         "reasoning_effort": "high",
-        "max_turns": 16,
+        "max_turns": 25,
         "collection_run_id": "offline-fixture"
       },
       "trajectory": {
@@ -38,7 +38,7 @@
         "model": "deepseek-v4-flash",
         "thinking": "enabled",
         "reasoning_effort": "high",
-        "max_turns": 16,
+        "max_turns": 25,
         "collection_run_id": "offline-fixture"
       },
       "trajectory": {

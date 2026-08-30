@@ -783,6 +783,17 @@ class RayPPOTrainer:
         )
         configured_milestones = self.config.trainer.get("milestones", [5, 50, 100, 150, 200])
         self.milestones = sorted({int(value) for value in configured_milestones if 0 < int(value) <= total_training_steps})
+        configured_save_freq = self.config.trainer.get("save_freq", -1)
+        try:
+            self.save_freq = -1 if configured_save_freq is None else int(configured_save_freq)
+        except (TypeError, ValueError) as exc:
+            raise ExperimentIntegrityError(
+                f"trainer.save_freq must be -1 or a positive integer, got {configured_save_freq!r}"
+            ) from exc
+        if self.save_freq == 0 or self.save_freq < -1:
+            raise ExperimentIntegrityError(
+                f"trainer.save_freq must be -1 or a positive integer, got {self.save_freq}"
+            )
         if self.device_name == "cuda" and self.run_until_step == 0:
             raise ExperimentIntegrityError("run_until_step=0 is only useful for a dry-run, not GPU training")
 
@@ -1639,14 +1650,19 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                             )
 
-                    # Milestones are deliberately ordered checkpoint first,
-                    # then fixed smoke20 validation.  Every milestone folder
-                    # is retained for later manual comparison.
+                    # Periodic saves follow trainer.save_freq (20 for the
+                    # TravelGym experiment).  Milestones are deliberately
+                    # ordered checkpoint first, then fixed smoke20 validation.
+                    # Every checkpoint folder is retained for later manual
+                    # comparison; periodic saves do not trigger validation.
                     is_milestone = self.global_steps in self.milestones
-                    if is_milestone or is_last_step:
+                    is_periodic_save = (
+                        self.save_freq > 0 and self.global_steps % self.save_freq == 0
+                    )
+                    if is_milestone or is_periodic_save or is_last_step:
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint(valid_save_best=False)
-                        if self.val_reward_fn is not None:
+                        if self.val_reward_fn is not None and (is_milestone or is_last_step):
                             with _timer("testing", timing_raw):
                                 val_metrics: dict = self._validate_smoke() if is_milestone else self._validate()
                                 if is_last_step:

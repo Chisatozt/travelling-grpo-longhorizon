@@ -13,6 +13,9 @@ The generated manifest has three *active* pools:
     reservation from the remaining train split.  Future DeepSeek Teacher
     collection is restricted to this pool; collecting another trajectory for
     an SFT task is allowed.
+``sft_smoke``
+    A fixed 20-task stratified subset of ``sft`` used for the paid smoke run;
+    it is a view, not a fourth disjoint active pool.
 ``grpo``
     All train-split tasks not reserved by ``sft`` (including its expansion
     reservation).
@@ -72,6 +75,10 @@ SMOKE_QUOTAS = {
     "travel444": 2,
     "travel2222": 2,
 }
+# A separate stratified view of the train-side SFT pool used for the paid
+# Teacher smoke collection.  It intentionally mirrors the eight-variant
+# validation smoke allocation while remaining a subset of ``sft``.
+SFT_SMOKE_QUOTAS = dict(SMOKE_QUOTAS)
 # Keep task-pool selection aligned with ``eval/build_test_manifests.py`` so
 # the validation pool is exactly the checked-in final200 manifest.
 TASK_POOL_SELECTION_SEED = 20260801
@@ -645,6 +652,34 @@ def build_task_pool_manifest(
     )
     sft_keys = historical_keys | expansion_keys
 
+    # Select a deterministic, composition-stratified 20-task smoke view from
+    # the already-reserved SFT pool.  The view is kept inside the formal
+    # manifest so smoke and full collection share one task-pool hash/cache
+    # provenance while the full pool remains exactly 600 tasks.
+    sft_by_env: dict[str, list[TaskRef]] = {env: [] for env in SUPPORTED_ENVS}
+    for ref in sft_refs:
+        sft_by_env.setdefault(ref.env_name, []).append(ref)
+    for env in sft_by_env:
+        sft_by_env[env].sort(key=lambda ref: _task_rank(seed, f"sft-smoke:{ref.key}"))
+    sft_smoke_refs: list[TaskRef] = []
+    for env in SUPPORTED_ENVS:
+        quota = int(SFT_SMOKE_QUOTAS.get(env, 0))
+        if quota > len(sft_by_env.get(env, [])):
+            raise TaskPoolError(
+                f"SFT smoke quota for {env}={quota} exceeds reserved SFT tasks "
+                f"{len(sft_by_env.get(env, []))}"
+            )
+        sft_smoke_refs.extend(sft_by_env[env][:quota])
+    sft_smoke_refs.sort(key=lambda ref: (SUPPORTED_ENVS.index(ref.env_name), _task_rank(seed, f"sft-smoke:{ref.key}")))
+    if len(sft_smoke_refs) != sum(SFT_SMOKE_QUOTAS.values()):
+        raise TaskPoolError(
+            f"SFT smoke selection returned {len(sft_smoke_refs)} tasks; "
+            f"expected {sum(SFT_SMOKE_QUOTAS.values())}"
+        )
+    sft_smoke_keys = {ref.key for ref in sft_smoke_refs}
+    if not sft_smoke_keys <= sft_keys:
+        raise TaskPoolError("SFT smoke selection escaped the formal SFT pool")
+
     train_refs = [ref for ref in train_inventory_refs if ref.key not in sft_keys]
     train_refs.sort(key=lambda ref: (SUPPORTED_ENVS.index(ref.env_name), _task_rank(seed, ref.key)))
     validation_refs = _select_stratified(
@@ -679,6 +714,13 @@ def build_task_pool_manifest(
             "historical_task_count": len(historical_refs),
             "expansion_task_count": len(expansion_refs),
             "records": [ref.to_dict() for ref in sft_refs],
+        },
+        "sft_smoke": {
+            "pool": "sft_smoke",
+            "parent_pool": "sft",
+            "split": "train",
+            "purpose": "20-task stratified smoke collection for DeepSeek Teacher",
+            "records": [ref.to_dict() for ref in sft_smoke_refs],
         },
         "grpo": {
             "pool": "grpo",
@@ -716,6 +758,8 @@ def build_task_pool_manifest(
         "sft_target_count": int(sft_target_count),
         "sft_historical_count": len(historical_refs),
         "sft_expansion_count": len(expansion_refs),
+        "sft_smoke_size": len(sft_smoke_refs),
+        "sft_smoke_quotas": {env: int(SFT_SMOKE_QUOTAS.get(env, 0)) for env in SUPPORTED_ENVS},
         "validation_size": int(validation_size),
         "smoke_size": int(smoke_size),
         # The active pools contain only authoritative env::task identities.
@@ -806,6 +850,10 @@ def assert_task_pools_disjoint(manifest: Mapping[str, Any], *, require_strict: b
     smoke = pool_task_keys(manifest, SMOKE_POOL_NAME)
     if not smoke <= active["validation"]:
         raise TaskPoolError("validation_smoke contains task(s) outside validation pool")
+    if "sft_smoke" in (manifest.get("pools") or {}):
+        sft_smoke = pool_task_keys(manifest, "sft_smoke")
+        if not sft_smoke <= active["sft"]:
+            raise TaskPoolError("sft_smoke contains task(s) outside the SFT pool")
     if require_strict and not _is_true_flag(manifest.get("strict_task_identity", False)):
         quarantined = manifest.get("quarantined_sft", manifest.get("unresolved_sft", []))
         raise TaskPoolError(
@@ -1017,6 +1065,7 @@ def main() -> None:
     print(
         f"wrote {output} "
         f"sft={len(_records_for(manifest, 'sft'))} "
+        f"sft_smoke={len(_records_for(manifest, 'sft_smoke'))} "
         f"grpo={len(_records_for(manifest, 'grpo'))} "
         f"validation={len(_records_for(manifest, 'validation'))} "
         f"smoke={len(_records_for(manifest, 'validation_smoke'))} "
@@ -1035,6 +1084,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SMOKE_POOL_NAME",
     "SMOKE_QUOTAS",
+    "SFT_SMOKE_QUOTAS",
     "SUPPORTED_ENVS",
     "DEFAULT_SFT_TARGET_COUNT",
     "OPAQUE_TASK_KEY_PREFIX",

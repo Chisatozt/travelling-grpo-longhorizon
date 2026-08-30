@@ -13,7 +13,7 @@ class Final200PlanTests(unittest.TestCase):
         self.models = {"base": "base", "sft": "sft", "grpo": "grpo", "deepseek": "deepseek"}
 
     def test_plan_has_all200_seen_unseen_and_manual_grpo(self):
-        plan = build_final200_plan(task_pool_manifest=self.pool, smoke_manifest=self.smoke, models=self.models, seed=1, max_turns=16, selected_grpo_checkpoint="ckpt")
+        plan = build_final200_plan(task_pool_manifest=self.pool, smoke_manifest=self.smoke, models=self.models, seed=1, max_turns=25, selected_grpo_checkpoint="ckpt")
         self.assertEqual(len(plan["splits"]["all200"]), 200)
         self.assertEqual(len(plan["splits"]["smoke20_seen"]), 20)
         self.assertEqual(len(plan["splits"]["unseen180"]), 180)
@@ -21,7 +21,7 @@ class Final200PlanTests(unittest.TestCase):
 
     def test_missing_selection_is_blocked(self):
         with self.assertRaises(Final200Error):
-            build_final200_plan(task_pool_manifest=self.pool, smoke_manifest=self.smoke, models=self.models, seed=1, max_turns=16)
+            build_final200_plan(task_pool_manifest=self.pool, smoke_manifest=self.smoke, models=self.models, seed=1, max_turns=25)
 
     def test_reward_version_cannot_drift(self):
         with self.assertRaises(Final200Error):
@@ -30,7 +30,7 @@ class Final200PlanTests(unittest.TestCase):
                 smoke_manifest=self.smoke,
                 models=self.models,
                 seed=1,
-                max_turns=16,
+                max_turns=25,
                 reward_version="different-reward-v0",
                 selected_grpo_checkpoint="ckpt",
             )
@@ -41,7 +41,7 @@ class Final200PlanTests(unittest.TestCase):
             smoke_manifest=self.smoke,
             models=self.models,
             seed=1,
-            max_turns=16,
+            max_turns=25,
             selected_grpo_checkpoint="ckpt",
         )
         calls = []

@@ -31,7 +31,7 @@ parquet 当作独立任务池。当前历史 244 条中有 6 条无法唯一恢�
 python .\eval\eval.py `
   --test-manifest .\eval\test_manifests\smoke20.json `
   --envs travel22 travel33 travel44 travel233 travel333 travel334 travel444 travel2222 `
-  --max_turns 16 --pass_k 1 --save_name outputs/smoke20
+  --max_turns 25 --pass_k 1 --save_name outputs/smoke20
 ```
 
 ## DeepSeek-V4-Flash Teacher
@@ -45,7 +45,7 @@ python .\eval\eval.py `
   --sft-collection --thinking enabled --include-think --require-think `
   --task-pool-manifest .\data\task_pools\travel_task_pools.json `
   --task-pool sft `
-  --max_turns 16 --save_name outputs/deepseek_teacher_sft
+  --max_turns 25 --save_name outputs/deepseek_teacher_sft
 ```
 
 API 请求使用 `extra_body.thinking={"type":"enabled"}` 和

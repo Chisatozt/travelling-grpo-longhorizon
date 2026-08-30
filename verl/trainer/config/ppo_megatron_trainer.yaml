@@ -176,7 +176,7 @@ actor_rollout_ref:
       do_sample: False # default eager for validation
     multi_turn: 
       enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
-      max_turns: null  # null for no limit (default max_length // 3)
+      max_turns: 25  # unified TravelGym multi-turn limit
       tool_config_path: null  # null for no tool
       # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
       # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
