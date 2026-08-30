@@ -1,0 +1,224 @@
+{
+  "schema_version": "travelgym-task-alignment-audit-v1",
+  "source_path": "sft/travel_sft_public.json",
+  "requires_review": false,
+  "quarantine_policy": "isolate_discard",
+  "records": [
+    {
+      "record_index": 97,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::3089e2f523836fc496c257b8c66bff348ac3d33016bef110c646a2bf9eaf81da",
+      "public_user_text_preview": "I am planning a trip to San Francisco from November 10th to November 17th, during which I will stay in a hotel and rent a car. I also plan to visit a restaurant in San Francisco on November 11th.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "hotel:3-137|rental_car:3-30",
+          "env_name": "travel33",
+          "task_key": "travel33::hotel:3-137|rental_car:3-30",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "hotel:3-139|rental_car:3-10",
+          "env_name": "travel33",
+          "task_key": "travel33::hotel:3-139|rental_car:3-10",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "hotel:3-140|rental_car:3-49|restaurant:3-112",
+          "env_name": "travel333",
+          "task_key": "travel333::hotel:3-140|rental_car:3-49|restaurant:3-112",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    },
+    {
+      "record_index": 144,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::d829e87bfd541fa31e31488fd44e5974e04eecc0e54861f2fae1e8ca1762e8df",
+      "public_user_text_preview": "I need a one-way flight from New York to Los Angeles on December 15th, a hotel stay in Los Angeles from December 15th to December 22nd, and a rental car in Los Angeles for the same dates.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "flight:3-185|hotel:2-11|rental_car:3-60",
+          "env_name": "travel233",
+          "task_key": "travel233::flight:3-185|hotel:2-11|rental_car:3-60",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "flight:4-433|hotel:4-72|rental_car:4-93",
+          "env_name": "travel444",
+          "task_key": "travel444::flight:4-433|hotel:4-72|rental_car:4-93",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    },
+    {
+      "record_index": 159,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::e131d0e49687a89cafc50b97622c92ffc0507db6083bf7acae53e75665676482",
+      "public_user_text_preview": "I am planning a trip to San Francisco from November 15th to November 20th, staying at a hotel and renting a car during this period.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "hotel:2-13|rental_car:2-23",
+          "env_name": "travel22",
+          "task_key": "travel22::hotel:2-13|rental_car:2-23",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "hotel:4-149|rental_car:4-107",
+          "env_name": "travel44",
+          "task_key": "travel44::hotel:4-149|rental_car:4-107",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    },
+    {
+      "record_index": 180,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::78fd3e30451e68f21a334b6503a21964c1fc9d048750f99b2be880c01979ca4c",
+      "public_user_text_preview": "I am planning a trip to San Francisco from November 10th to November 15th, staying in a hotel. I also plan to dine at a restaurant in San Francisco on November 12th.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "hotel:2-66|restaurant:2-44",
+          "env_name": "travel22",
+          "task_key": "travel22::hotel:2-66|restaurant:2-44",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "hotel:3-140|restaurant:3-132",
+          "env_name": "travel33",
+          "task_key": "travel33::hotel:3-140|restaurant:3-132",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    },
+    {
+      "record_index": 206,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::1c44e2e96b9457c21b7c803053dab33391baee47ba23bb612881fcca404a2482",
+      "public_user_text_preview": "I need a one-way flight from Los Angeles to New York City on November 15th and a hotel stay in New York City from November 15th to November 20th.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "flight:2-61|hotel:2-75",
+          "env_name": "travel22",
+          "task_key": "travel22::flight:2-61|hotel:2-75",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "flight:2-65|hotel:2-44",
+          "env_name": "travel22",
+          "task_key": "travel22::flight:2-65|hotel:2-44",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "flight:3-168|hotel:3-122",
+          "env_name": "travel33",
+          "task_key": "travel33::flight:3-168|hotel:3-122",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "flight:3-44|hotel:3-157",
+          "env_name": "travel33",
+          "task_key": "travel33::flight:3-44|hotel:3-157",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    },
+    {
+      "record_index": 208,
+      "source_path": "sft/travel_sft_public.json",
+      "opaque_task_key": "opaque_sft::e70679e080acdfd71efab4969b8f6d03185fcfa040a3fba6b55a32d5b78d563d",
+      "public_user_text_preview": "I am planning a trip to San Francisco from November 10th to November 15th, staying in a hotel. I also plan to dine at a restaurant in San Francisco on November 12th.\nAlso my budget is limited so as long as my preferences are satisfied, I would also like to choose the cheapest option for each.",
+      "candidates": [
+        {
+          "task_id": "hotel:2-66|restaurant:2-44",
+          "env_name": "travel22",
+          "task_key": "travel22::hotel:2-66|restaurant:2-44",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        },
+        {
+          "task_id": "hotel:3-140|restaurant:3-132",
+          "env_name": "travel33",
+          "task_key": "travel33::hotel:3-140|restaurant:3-132",
+          "evidence": [
+            "initial_description_match"
+          ],
+          "inventory_present": true,
+          "requires_human_review": true
+        }
+      ],
+      "resolved_without_review": false,
+      "requires_review": false,
+      "quarantine_status": "discarded"
+    }
+  ]
+}

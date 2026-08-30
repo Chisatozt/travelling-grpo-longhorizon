@@ -1,0 +1,17 @@
+tool_schema:
+  type: "function"
+  function:
+    name: "interact_with_env"
+    description: "TravelGym public protocol: Search returns the complete candidate list; Action gathers natural-language evidence without filtering; Answer submits exactly one option ID visible in the current Search result."
+    parameters:
+      type: "object"
+      properties:
+        choice:
+          type: "string"
+          enum: ["search", "action", "answer"]
+          description: "Use search, action, or answer in the public protocol."
+        content:
+          type: "string"
+          description: "Search query, natural-language evidence question, or exactly one visible option ID."
+      required: ["choice", "content"]
+      additionalProperties: false

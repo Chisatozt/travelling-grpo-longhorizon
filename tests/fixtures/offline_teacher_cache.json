@@ -1,0 +1,58 @@
+{
+  "schema_version": "travelgym-teacher-cache-v1",
+  "collection_run_id": "offline-fixture",
+  "records": {
+    "travel22::fixture-task::0": {
+      "status": "success",
+      "provenance": {
+        "task_key": "travel22::fixture-task",
+        "env_name": "travel22",
+        "task_id": "fixture-task",
+        "pass_index": 0,
+        "model": "deepseek-v4-flash",
+        "thinking": "enabled",
+        "reasoning_effort": "high",
+        "max_turns": 16,
+        "collection_run_id": "offline-fixture"
+      },
+      "trajectory": {
+        "messages": [
+          {"role": "user", "content": "Find a suitable travel option."},
+          {"role": "assistant", "content": "<think>Inspect the available options.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"search\",\"content\":\"flight\"}}\n</tool_call>"},
+          {"role": "tool", "content": "Here are all the options for <flight>: F1, F2"},
+          {"role": "assistant", "content": "<think>Ask for one useful preference.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"action\",\"content\":\"Which flight amenities matter?\"}}\n</tool_call>"},
+          {"role": "tool", "content": "I prefer a direct flight."},
+          {"role": "assistant", "content": "<think>Select the visible direct option.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"answer\",\"content\":\"F1\"}}\n</tool_call>"},
+          {"role": "tool", "content": "Your answer was recorded."}
+        ],
+        "tools": []
+      }
+    },
+    "travel22::fixture-task::1": {
+      "status": "success",
+      "provenance": {
+        "task_key": "travel22::fixture-task",
+        "env_name": "travel22",
+        "task_id": "fixture-task",
+        "pass_index": 1,
+        "model": "deepseek-v4-flash",
+        "thinking": "enabled",
+        "reasoning_effort": "high",
+        "max_turns": 16,
+        "collection_run_id": "offline-fixture"
+      },
+      "trajectory": {
+        "messages": [
+          {"role": "user", "content": "Find a suitable travel option."},
+          {"role": "assistant", "content": "<think>Inspect the available options.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"search\",\"content\":\"flight\"}}\n</tool_call>"},
+          {"role": "tool", "content": "Here are all the options for <flight>: F1, F2"},
+          {"role": "assistant", "content": "<think>Ask for one useful preference.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"action\",\"content\":\"Which flight amenities matter?\"}}\n</tool_call>"},
+          {"role": "tool", "content": "I prefer a direct flight."},
+          {"role": "assistant", "content": "<think>Select the visible direct option.</think>\n<tool_call>\n{\"name\":\"interact_with_env\",\"arguments\":{\"choice\":\"answer\",\"content\":\"F1\"}}\n</tool_call>"},
+          {"role": "tool", "content": "Your answer was recorded."}
+        ],
+        "tools": []
+      }
+    }
+  }
+}
