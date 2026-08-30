@@ -95,7 +95,7 @@ def build_summary(cache_path: Path, task_pool_path: Path | None = None) -> dict[
     pass_stats = summarize_pass_stats(records)
     token_quantiles: dict[str, dict[str, float | None]] = {}
     elapsed_quantiles: dict[str, dict[str, float | None]] = {}
-    for status in ("success", "invalid", "in_flight"):
+    for status in ("success", "invalid", "abandoned", "in_flight"):
         token_quantiles[status] = _quantiles(
             [float(value.get("token_count", 0) or 0) for value in values if value.get("status") == status]
         )
@@ -111,7 +111,7 @@ def build_summary(cache_path: Path, task_pool_path: Path | None = None) -> dict[
     tool_call_blocks = 0
     private_markers = 0
     for value in values:
-        if value.get("status") == "in_flight":
+        if value.get("status") in {"in_flight", "abandoned"}:
             continue
         trajectory = value.get("trajectory", {})
         messages = trajectory.get("messages", []) if isinstance(trajectory, dict) else []

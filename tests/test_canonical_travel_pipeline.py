@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -363,7 +364,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         mask = exact_assistant_token_mask(messages, full, render, [0, 1, 0])
         self.assertEqual(mask[3:5], [1, 1])
 
-    def test_qwen_template_boundary_serializes_structured_arguments(self):
+    def test_qwen_template_boundary_preserves_structured_arguments(self):
         messages = [{
             "role": "assistant",
             "content": "",
@@ -377,8 +378,13 @@ class CanonicalPipelineTests(unittest.TestCase):
             }],
         }]
         prepared = template_messages(messages)
-        self.assertIsInstance(prepared[0]["tool_calls"][0]["function"]["arguments"], str)
+        self.assertIsInstance(prepared[0]["tool_calls"][0]["function"]["arguments"], dict)
         self.assertIsInstance(messages[0]["tool_calls"][0]["function"]["arguments"], dict)
+
+        legacy = copy.deepcopy(messages)
+        legacy[0]["tool_calls"][0]["function"]["arguments"] = '{"choice":"search","content":"flight"}'
+        parsed = template_messages(legacy)
+        self.assertEqual(parsed[0]["tool_calls"][0]["function"]["arguments"], messages[0]["tool_calls"][0]["function"]["arguments"])
 
     def test_tool_schema_is_shared_with_eval_and_sglang_config(self):
         expected = canonical_tools_schema()[0]

@@ -97,7 +97,13 @@ def select_validation_tasks(
 
     if count < 1:
         raise SFTSplitError("validation task count must be positive")
-    required = list(required_envs or ("travel22", "travel33", "travel44", "travel233", "travel333", "travel334", "travel444", "travel2222"))
+    default_envs = ("travel22", "travel33", "travel44", "travel233", "travel333", "travel334", "travel444", "travel2222")
+    # The formal contract selects gold10 from *all* strict_gold groups.  When
+    # callers do not explicitly require a coverage list, an environment with
+    # no strict_gold group is recorded as absent rather than making the split
+    # impossible.  Explicit ``required_envs`` remains a strict audit mode.
+    strict_required_envs = required_envs is not None
+    required = list(required_envs) if strict_required_envs else list(default_envs)
     groups: dict[str, list[int]] = {}
     for index, record in enumerate(records):
         metadata = record.get("trainer_metadata", {}) if isinstance(record, Mapping) else {}
@@ -115,8 +121,10 @@ def select_validation_tasks(
     for key in groups:
         env_groups.setdefault(_env_from_task_key(key), []).append(key)
     missing = [env for env in required if not env_groups.get(env)]
-    if missing:
+    if missing and strict_required_envs:
         raise SFTSplitError(f"strict_gold pool cannot cover environments: {missing}")
+    if missing:
+        required = [env for env in required if env_groups.get(env)]
     selected: list[str] = []
     # First guarantee all eight environment variants.  A stable hash, rather
     # than source order, keeps the split reproducible after cache merging.
@@ -183,8 +191,15 @@ def build_sft_split(
         try:
             from transformers import AutoTokenizer
             from .qwen35_mask import native_template_ids
-        except ImportError as exc:  # pragma: no cover - production dependency
-            raise SFTSplitError("tokenizer audit requires transformers and qwen35_mask") from exc
+        except ImportError:
+            # ``merge_travel_sft.py`` is commonly invoked as a direct script,
+            # where this module has no package parent for the relative import.
+            # The repository root is added by the merge entrypoint, so use the
+            # namespace-package spelling before falling back to a direct path.
+            try:
+                from sft.qwen35_mask import native_template_ids
+            except ImportError as exc:  # pragma: no cover - production dependency
+                raise SFTSplitError("tokenizer audit requires transformers and qwen35_mask") from exc
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
         def token_length_fn(record: Mapping[str, Any]) -> int:
             return len(native_template_ids(tokenizer, record["messages"], tools=record.get("tools"), enable_thinking=True, add_generation_prompt=False))

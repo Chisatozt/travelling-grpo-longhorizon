@@ -1474,7 +1474,7 @@ async def main():
                 str(value.get("provenance", {}).get("task_key"))
                 for value in cache.records.values()
                 if isinstance(value, Mapping)
-                and value.get("status") in {"in_flight", "invalid", "success"}
+                and value.get("status") in {"in_flight", "invalid", "abandoned", "success"}
                 and isinstance(value.get("provenance"), Mapping)
             }
             fresh_tasks = [

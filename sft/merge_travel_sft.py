@@ -27,9 +27,17 @@ import hashlib
 import json
 import math
 import statistics
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping
+
+# ``python sft/merge_travel_sft.py`` sets ``sys.path[0]`` to ``sft/``.  Add
+# the repository root so the manifest validator can import the shared Teacher
+# cache helpers from the sibling ``eval/`` namespace package.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from .travel_canonical import (

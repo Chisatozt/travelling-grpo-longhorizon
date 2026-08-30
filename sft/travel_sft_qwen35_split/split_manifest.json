@@ -1,0 +1,70 @@
+{
+  "schema_version": "travelgym-sft-split-v1",
+  "max_length": 32768,
+  "truncation": "error",
+  "tokenizer": "Qwen/Qwen3.5-4B",
+  "token_audit_exact": true,
+  "validation_count": 10,
+  "selection_seed": 20260801,
+  "selected_task_keys": [
+    "travel22::flight:2-76|restaurant:2-81",
+    "travel22::flight:2-52|restaurant:2-13",
+    "travel22::flight:2-62|restaurant:2-94",
+    "travel233::hotel:2-58|rental_car:3-82|restaurant:3-28",
+    "travel33::rental_car:3-153|restaurant:3-343",
+    "travel33::apartment:3-209|restaurant:3-207",
+    "travel333::flight:3-56|hotel:3-22|restaurant:3-57",
+    "travel334::apartment:3-142|rental_car:4-2|restaurant:3-319",
+    "travel44::flight:4-293|apartment:4-111",
+    "travel44::apartment:4-305|restaurant:4-291"
+  ],
+  "train_record_count": 490,
+  "validation_record_count": 14,
+  "train_task_count": 389,
+  "validation_task_count": 10,
+  "source_record_count": 795,
+  "selection": {
+    "required_envs": [
+      "travel22",
+      "travel33",
+      "travel44",
+      "travel233",
+      "travel333",
+      "travel334"
+    ],
+    "selection_seed": 20260801,
+    "selected_task_keys": [
+      "travel22::flight:2-76|restaurant:2-81",
+      "travel22::flight:2-52|restaurant:2-13",
+      "travel22::flight:2-62|restaurant:2-94",
+      "travel233::hotel:2-58|rental_car:3-82|restaurant:3-28",
+      "travel33::rental_car:3-153|restaurant:3-343",
+      "travel33::apartment:3-209|restaurant:3-207",
+      "travel333::flight:3-56|hotel:3-22|restaurant:3-57",
+      "travel334::apartment:3-142|rental_car:4-2|restaurant:3-319",
+      "travel44::flight:4-293|apartment:4-111",
+      "travel44::apartment:4-305|restaurant:4-291"
+    ],
+    "selected_envs": [
+      "travel22",
+      "travel233",
+      "travel33",
+      "travel333",
+      "travel334",
+      "travel44"
+    ],
+    "length_buckets": {
+      "travel22::flight:2-76|restaurant:2-81": "short",
+      "travel22::flight:2-52|restaurant:2-13": "short",
+      "travel22::flight:2-62|restaurant:2-94": "short",
+      "travel233::hotel:2-58|rental_car:3-82|restaurant:3-28": "long",
+      "travel33::rental_car:3-153|restaurant:3-343": "long",
+      "travel33::apartment:3-209|restaurant:3-207": "short",
+      "travel333::flight:3-56|hotel:3-22|restaurant:3-57": "long",
+      "travel334::apartment:3-142|rental_car:4-2|restaurant:3-319": "long",
+      "travel44::flight:4-293|apartment:4-111": "long",
+      "travel44::apartment:4-305|restaurant:4-291": "mid"
+    },
+    "strict_gold_group_count": 13
+  }
+}

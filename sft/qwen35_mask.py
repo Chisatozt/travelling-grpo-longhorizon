@@ -17,10 +17,11 @@ def template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, A
     """Prepare canonical messages for Qwen's native chat template.
 
     Canonical storage keeps ``function.arguments`` as a structured mapping so
-    protocol validation is deterministic.  Qwen3.5's Jinja templates and most
-    OpenAI-compatible tokenizers expect that field as a JSON string.  Convert
-    only at the tokenizer boundary; the canonical record and environment wire
-    format remain unchanged.
+    protocol validation is deterministic.  Qwen3.5's native Jinja template
+    iterates that mapping directly when rendering ``<parameter=...>`` blocks,
+    so do not stringify it at the tokenizer boundary.  If a legacy record
+    carries a JSON-encoded argument string, parse it back to a mapping when
+    possible; the canonical record itself remains unchanged.
     """
 
     prepared = copy.deepcopy(list(messages))
@@ -37,10 +38,13 @@ def template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, A
             if not isinstance(function, dict):
                 continue
             arguments = function.get("arguments")
-            if isinstance(arguments, Mapping):
-                function["arguments"] = json.dumps(
-                    dict(arguments), ensure_ascii=False, separators=(",", ":")
-                )
+            if isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, Mapping):
+                    function["arguments"] = dict(parsed)
     return prepared
 
 

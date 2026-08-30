@@ -149,10 +149,10 @@ their CoT and tool call), and partial-correct rows carry weight 0.5.  See
 [sft/README.md](sft/README.md) for task-pool expansion, audit and validation details.
 
 ```bash
-python -m verl.trainer.fsdp_sft_trainer \
+torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
   --config-path=verl/trainer/config \
   --config-name=travel_qwen35_sft \
-  data.train_files=sft/train.jsonl \
+  trainer.n_gpus_per_node=1 \
   model.partial_pretrain=Qwen/Qwen3.5-4B
 ```
 

@@ -1,0 +1,56 @@
+{
+  "schema_version": "travelgym-canonical-v1",
+  "template": {
+    "tokenizer": "Qwen/Qwen3.5-4B",
+    "tokenizer_revision": null,
+    "enable_thinking": true
+  },
+  "max_length": 32768,
+  "truncation": "error",
+  "length_unit": "tokens",
+  "lengths": {
+    "count": 795,
+    "p50": 5961,
+    "p90": 16129,
+    "p95": 17551,
+    "p99": 22619,
+    "max": 28361
+  },
+  "overlength_count": 0,
+  "duplicate_count": 36,
+  "classification": {
+    "partial_correct": {
+      "records": 438,
+      "supervised_message_turns": 2457,
+      "effective_supervised_tokens": 1067612
+    },
+    "totally_wrong": {
+      "records": 294,
+      "supervised_message_turns": 419,
+      "effective_supervised_tokens": 168042
+    },
+    "strict_gold": {
+      "records": 13,
+      "supervised_message_turns": 87,
+      "effective_supervised_tokens": 14588
+    },
+    "recoverable_correct": {
+      "records": 50,
+      "supervised_message_turns": 428,
+      "effective_supervised_tokens": 276800
+    }
+  },
+  "source_distribution": {
+    "deepseek_teacher": 557,
+    "historical_public": 238
+  },
+  "effective_supervised_tokens": 1527042,
+  "eligible_effective_supervised_tokens": 1359000,
+  "exclusion_reasons": {
+    "nontravel_dropped": 0,
+    "opaque_quarantined": 6,
+    "totally_wrong": 294
+  },
+  "note": "effective_supervised_tokens is exact only when --tokenizer is supplied; otherwise supervised_message_turns is a structural count.",
+  "task_pool_manifest": "D:\\Code\\Python\\vscodeProjects\\travelling-grpo-longhorizon\\data\\task_pools\\travel_task_pools.json"
+}

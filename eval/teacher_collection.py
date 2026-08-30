@@ -192,6 +192,7 @@ class TeacherCache:
             "completed_tasks": 0,
             "valid_trajectories": 0,
             "invalid_trajectories": 0,
+            "abandoned_trajectories": 0,
             "api_errors": 0,
             "missing_reasoning": 0,
             "tokens": 0,
@@ -305,7 +306,7 @@ class TeacherCache:
                 # retried because no provider response was committed.
                 if not self.has_success(str(env_name), str(task_id), index) and not (
                     isinstance(existing, Mapping)
-                    and existing.get("status") in {"in_flight", "invalid"}
+                    and existing.get("status") in {"in_flight", "invalid", "abandoned"}
                 ):
                     output.append({"env_name": str(env_name), "task_id": str(task_id), "pass_index": index, "task_key": teacher_pass_key(str(env_name), str(task_id), index)})
         return output
@@ -323,7 +324,7 @@ class TeacherCache:
         if self.has_success(env_name, task_id, pass_index):
             return None
         existing = self.records.get(key)
-        if isinstance(existing, Mapping) and existing.get("status") in {"in_flight", "invalid"}:
+        if isinstance(existing, Mapping) and existing.get("status") in {"in_flight", "invalid", "abandoned"}:
             return None
         request_id = str(uuid.uuid4())
         claim_provenance = self._default_provenance(
@@ -423,6 +424,42 @@ class TeacherCache:
         self._refresh_completed_tasks()
         self._write()
 
+    def abandon_in_flight(
+        self,
+        *,
+        env_name: str,
+        task_id: str,
+        pass_index: int,
+        reason: str = "abandoned_by_user",
+    ) -> bool:
+        """Mark an unresolved paid-request marker as a terminal failure.
+
+        This is intentionally separate from ``invalid``: an ``invalid`` pass
+        has a provider response that failed local validation, whereas an
+        abandoned pass has no trustworthy response and must never be silently
+        re-issued on resume.  The original request/provenance fields remain
+        intact for audit and billing reconciliation.
+        """
+
+        key = teacher_pass_key(env_name, task_id, pass_index)
+        value = self.records.get(key)
+        if not isinstance(value, Mapping) or value.get("status") != "in_flight":
+            return False
+        record = dict(value)
+        record.update(
+            {
+                "status": "abandoned",
+                "abandoned_at": time.time(),
+                "abandon_reason": str(reason),
+                "reconcile_required": False,
+            }
+        )
+        self.records[key] = record
+        self.stats["abandoned_trajectories"] = int(self.stats.get("abandoned_trajectories", 0)) + 1
+        self._refresh_completed_tasks()
+        self._write()
+        return True
+
     def record_error(
         self,
         *,
@@ -483,6 +520,7 @@ def summarize_pass_stats(records: Mapping[str, Mapping[str, Any]]) -> dict[str, 
             "attempted": 0,
             "success": 0,
             "invalid": 0,
+            "abandoned": 0,
             "error": 0,
             "in_flight": 0,
         }

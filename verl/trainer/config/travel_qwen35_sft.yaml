@@ -9,8 +9,8 @@ data:
   # The task-grouped split is the authoritative SFT input.  The legacy
   # ``travel_sft_canonical.train.jsonl`` remains an audit/compatibility
   # artifact, but must not bypass the gold10 task isolation.
-  train_files: sft/train.jsonl
-  val_files: sft/val_gold10.jsonl
+  train_files: sft/travel_sft_qwen35_split/train.jsonl
+  val_files: sft/travel_sft_qwen35_split/val_gold10.jsonl
   # Per-GPU micro batch size for the 4B LoRA SFT run.
   micro_batch_size_per_gpu: 1
   max_length: 32768

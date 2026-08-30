@@ -58,6 +58,23 @@ class TeacherCollectionTests(unittest.TestCase):
             self.assertEqual(pending, [{"env_name": "travel22", "task_id": "t1", "pass_index": 1, "task_key": "travel22::t1::1"}])
             self.assertIsNone(cache.claim(env_name="travel22", task_id="t1", pass_index=0))
 
+    def test_abandoned_in_flight_is_terminal_and_not_rebilled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "teacher.json"
+            cache = TeacherCache(path, collection_run_id="run-1")
+            self.assertIsNotNone(cache.claim(env_name="travel22", task_id="t1", pass_index=0))
+            self.assertTrue(cache.abandon_in_flight(
+                env_name="travel22", task_id="t1", pass_index=0,
+                reason="user_requested_abandonment",
+            ))
+            self.assertEqual(cache.records["travel22::t1::0"]["status"], "abandoned")
+            self.assertEqual(cache.stats["abandoned_trajectories"], 1)
+            self.assertEqual(cache.stats["in_flight_passes"], 0)
+            self.assertEqual(cache.pending([{"env_name": "travel22", "task_id": "t1"}]), [
+                {"env_name": "travel22", "task_id": "t1", "pass_index": 1, "task_key": "travel22::t1::1"}
+            ])
+            self.assertIsNone(cache.claim(env_name="travel22", task_id="t1", pass_index=0))
+
     def test_collection_stats_include_invalid_and_missing_reasoning(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = TeacherCache(Path(directory) / "teacher.json", collection_run_id="run-1")

@@ -46,6 +46,22 @@ class SFTSplitTests(unittest.TestCase):
         with self.assertRaises(SFTSplitError):
             build_sft_split([_record("travel22::a")], [{"task_key": "travel22::a"}], output_dir=".")
 
+    def test_default_split_tolerates_missing_environment_strict_gold(self):
+        records, audits = [], []
+        for index, env in enumerate(ENVS[:6]):
+            key = f"{env}::task-{index}"
+            records.append(_record(key, length=10 + index))
+            audits.append({"task_key": key})
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = build_sft_split(
+                records,
+                audits,
+                output_dir=Path(directory),
+                token_length_fn=lambda row: row["_test_length"],
+                validation_count=6,
+            )
+            self.assertEqual(manifest["validation_task_count"], 6)
+
     def test_formal_split_rejects_task_outside_sft_pool(self):
         records, audits = [], []
         for index, env in enumerate(ENVS + ["travel22", "travel33"]):

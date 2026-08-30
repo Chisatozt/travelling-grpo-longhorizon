@@ -132,10 +132,10 @@ totally_wrong、infrastructure_invalid、overlength 不进入 SFT。
 `Qwen/Qwen3.5-4B`、LoRA rank 16、32K、`truncation=error`、原生 Qwen template：
 
 ```bash
-python -m verl.trainer.fsdp_sft_trainer \
+torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
   --config-path=verl/trainer/config \
   --config-name=travel_qwen35_sft \
-  data.train_files=sft/train.jsonl \
+  trainer.n_gpus_per_node=1 \
   model.partial_pretrain=Qwen/Qwen3.5-4B
 ```
 
