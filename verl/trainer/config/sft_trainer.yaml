@@ -21,6 +21,12 @@ data:
     sample_weight_key: sample_weight
     require_assistant_train_mask: false
     train_last_assistant_only: false
+    # Generic datasets retain fixed max-length padding unless explicitly
+    # enabled by a task-specific config.
+    dynamic_padding: false
+    length_bucketing: false
+    pad_to_multiple_of: 128
+    length_bucket_size_multiplier: 50
   max_length: 32768
   truncation: error
   balance_dp_token: False

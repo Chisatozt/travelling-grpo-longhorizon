@@ -17,6 +17,7 @@ from collections import defaultdict
 import torch
 
 from verl import DataProto
+from verl.tools.travel_reward_metrics import TRAVEL_REWARD_METRIC_NAMES
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
@@ -93,19 +94,29 @@ class NaiveRewardManager:
                     score = {
                         "score": sum_score,
                         "terminal_reward": sum_score,
-                        "reward_version": "travelgym-terminal-v1",
+                        "reward_version": "travelgym-terminal-v2",
+                        "reward_valid": float(
+                            bool(raw_scores.get("interact_with_env_reward_valid", 0.0))
+                        ),
                     }
-                    for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate"):
+                    # One value per row is mandatory. Invalid rollouts carry
+                    # zero defaults; this also keeps older artifacts aligned.
+                    for metric_name in TRAVEL_REWARD_METRIC_NAMES:
                         key = f"interact_with_env_{metric_name}"
-                        if key in raw_scores:
-                            score[metric_name] = float(raw_scores[key])
+                        try:
+                            score[metric_name] = float(raw_scores.get(key, 0.0))
+                        except (TypeError, ValueError):
+                            score[metric_name] = 0.0
                 else:
                     sum_score = float(data_item.non_tensor_batch.get("terminal_reward", 0.0) or 0.0)
                     score = {
                         "score": sum_score,
                         "terminal_reward": sum_score,
-                        "reward_version": "travelgym-terminal-v1",
+                        "reward_version": "travelgym-terminal-v2",
+                        "reward_valid": 0.0,
                     }
+                    for metric_name in TRAVEL_REWARD_METRIC_NAMES:
+                        score[metric_name] = 0.0
             else:
                 score = self.compute_score(
                     data_source=data_source,

@@ -76,6 +76,21 @@ def assert_template_equivalence(official_ids: Sequence[int], training_ids: Seque
         )
 
 
+def causal_target_mask(token_mask: Any) -> Any:
+    """Align a token-position mask with next-token causal-LM losses.
+
+    A causal loss at logit position ``i`` predicts ``input_ids[i + 1]``.  The
+    masks built in this module are indexed by the target token itself, so the
+    loss-width mask must drop the first token, not the last one.  The helper is
+    intentionally duck-typed so it works for both dependency-free list tests
+    and the trainer's ``torch.Tensor`` batches.
+    """
+
+    if hasattr(token_mask, "ndim") and int(token_mask.ndim) > 1:
+        return token_mask[..., 1:]
+    return token_mask[1:]
+
+
 def exact_assistant_token_mask(
     messages: Sequence[Mapping[str, Any]],
     full_ids: Sequence[int],
@@ -199,6 +214,13 @@ def native_template_ids(tokenizer: Any, messages: Sequence[Mapping[str, Any]], t
     except TypeError:
         kwargs.pop("enable_thinking", None)
         output = tokenizer.apply_chat_template(messages, **kwargs)
+    # Transformers 5 returns a BatchEncoding for Qwen3.5 even when
+    # ``return_dict`` is not explicitly requested; Transformers 4 commonly
+    # returns the token list directly. Support both without changing tokens.
+    if isinstance(output, Mapping):
+        output = output.get("input_ids")
+        if output is None:
+            raise ValueError("Qwen3.5 chat template output is missing input_ids")
     if hasattr(output, "tolist") and not isinstance(output, list):
         output = output.tolist()
     if output and isinstance(output[0], list):
@@ -208,6 +230,7 @@ def native_template_ids(tokenizer: Any, messages: Sequence[Mapping[str, Any]], t
 
 __all__ = [
     "assert_template_equivalence",
+    "causal_target_mask",
     "exact_assistant_token_mask",
     "exact_assistant_span_masks",
     "native_template_ids",

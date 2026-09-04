@@ -309,6 +309,16 @@ def invalid_travel_report(reason: str) -> dict[str, object]:
         "terminal_reward": 0.0,
         "termination_reason": str(reason),
     }
+
+
+def _is_successful_completion(report: Any) -> bool:
+    """Return the pass@k predicate without exposing private labels."""
+    if not isinstance(report, Mapping):
+        return False
+    try:
+        return float(report.get("completion_success", report.get("success_completion", 0.0)) or 0.0) >= 1.0
+    except (TypeError, ValueError):
+        return False
     
 async def load_data(env_name, one_choice=True, split="test", task_ids=None):
     if pd is None:
@@ -427,6 +437,11 @@ async def build_env(
     config.data_source = gold
     config.model_name = model_name
     config.seed = seed
+    config.user_simulator_mode = (
+        "deepseek_api"
+        if model_client is not None
+        else os.environ.get("TRAVELGYM_USER_SIMULATOR", config.user_simulator_mode)
+    )
     # The environment's User Simulator uses the same OpenAI-compatible
     # endpoint.  Keep its per-call timeout configurable for remote Teacher
     # collection; the historical TravelGym default remains 15 seconds when
@@ -438,7 +453,7 @@ async def build_env(
         )
     )
     config.one_choice_per_aspect = True
-    config.reward_version = "travelgym-terminal-v1"
+    config.reward_version = "travelgym-terminal-v2"
     config.require_action_before_answer = False
     env = travelgym.TravelEnv(config=config)
     if isinstance(telemetry, dict):
@@ -792,6 +807,7 @@ async def rollout(
     reasoning_effort=None,
     pass_index=None,
     provenance=None,
+    user_model_client=None,
 ):
     turn = 0
     turn_rewards = []
@@ -807,7 +823,10 @@ async def rollout(
             max_turns,
             seed=seed,
             telemetry=telemetry,
-            model_client=client,
+            # Evaluation may serve the local Actor while retaining the
+            # externally configured DeepSeek User Simulator.  Keep the
+            # historical single-client behavior when no override is given.
+            model_client=user_model_client if user_model_client is not None else client,
             user_request_limit=user_request_semaphore,
         )
         while turn < max_turns:
@@ -995,10 +1014,12 @@ async def post_process_results(results, reward_cache, env, pass_k):
     micro_avg = []
     valid_rollouts = 0
     total_rollouts = 0
+    pass_success_tasks = 0
     for hash_id in reward_cache[env]:
         terminal_scores = reward_cache[env][hash_id]["reward"]
         micro_avg.append(sum(terminal_scores) / len(terminal_scores) if terminal_scores else 0.0)
         reports = reward_cache[env][hash_id].get("reward_report", [])
+        pass_success_tasks += int(any(_is_successful_completion(report) for report in reports))
         total_rollouts += len(terminal_scores)
         valid_rollouts += sum(
             int(bool(report.get("reward_valid", False)))
@@ -1015,6 +1036,13 @@ async def post_process_results(results, reward_cache, env, pass_k):
         valid_rollouts / total_rollouts if total_rollouts else 0.0
     )
     results[env][str(pass_k)]["invalid_rollout_count"] = total_rollouts - valid_rollouts
+    task_count = len(micro_avg)
+    results[env][str(pass_k)][f"pass@{pass_k}"] = (
+        pass_success_tasks / task_count if task_count else 0.0
+    )
+    results[env][str(pass_k)]["pass_definition"] = "completion_success==1"
+    results[env][str(pass_k)]["early_stop"] = True
+    results[env][str(pass_k)]["task_count"] = task_count
     terminal_max = results[env][str(pass_k)]["terminal_max"]
     print(f"\n ######### Pass {pass_k} terminal reward: {terminal_max} ######### \n")
     return results
@@ -1240,6 +1268,38 @@ async def main():
             max_retries=0,
         )
 
+
+    # A local SFT Actor and a remote DeepSeek User Simulator use different
+    # OpenAI-compatible endpoints.  The override is opt-in so historical
+    # Teacher/evaluator invocations remain single-client compatible.
+    user_client = client
+    user_api_endpoint_label = api_endpoint_label
+    if not args.dry_run and "gemini" not in args.model_name.lower():
+        configured_user_url = os.environ.get("TRAVELGYM_USER_BASE_URL")
+        configured_user_key = os.environ.get("TRAVELGYM_USER_API_KEY")
+        if configured_user_url or configured_user_key:
+            user_base_url = configured_user_url or base_url
+            user_api_key = (
+                configured_user_key
+                or os.environ.get("DEEPSEEK_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+                or "dummy"
+            )
+            user_timeout = float(
+                os.environ.get(
+                    "TRAVELGYM_USER_TIMEOUT",
+                    os.environ.get("OPENAI_REQUEST_TIMEOUT", 60.0),
+                )
+            )
+            if user_timeout <= 0:
+                raise ValueError("TRAVELGYM_USER_TIMEOUT must be positive")
+            user_client = AsyncOpenAI(
+                api_key=user_api_key,
+                base_url=user_base_url,
+                timeout=user_timeout,
+                max_retries=0,
+            )
+            user_api_endpoint_label = public_endpoint_label(user_base_url)
     function = yaml.safe_load(open(f"{PROJECT_ROOT}/schema/interact_tool.yaml", "r"))["tool_schema"]
 
     pool_manifest_path = None
@@ -1392,7 +1452,11 @@ async def main():
             "selected_task_pool_hash": selected_task_pool_hash,
             "task_pool_source_hash": task_pool_source_hash,
             "pass_k": 2 if args.sft_collection else max(args.pass_k or [1]),
+            "pass_definition": "completion_success==1",
+            "early_stop": True,
             "api_endpoint_label": api_endpoint_label,
+            "user_api_endpoint_label": user_api_endpoint_label,
+            "user_model_name": os.environ.get("USER_MODEL_NAME", "gpt-4o"),
             "collection_run_id": run_id if args.sft_collection else None,
             "tool_schema": function,
             "task_manifest": travel_manifest,
@@ -1608,7 +1672,7 @@ async def main():
                 result = await limited_rollout(
                     copy.deepcopy(data_item), client, function, args.temperature, args.max_turns,
                     args.model_name, args.thinking, args.seed, True, "omit", True,
-                    "high", pass_index, provenance,
+                    "high", pass_index, provenance, user_model_client=user_client,
                 )
                 report = result.get("reward_report") or {}
                 valid = bool(report.get("reward_valid", True)) and result.get("data") is not None
@@ -1756,19 +1820,33 @@ async def main():
                 print(f"Pass {pass_k} already evaluated, skipping...")
                 continue
 
-            reqs = []
-            # use limited rollout to avoid getting stuck
-            for d in data:
-                data_id = hash(d)
-                existing_number = len(reward_cache[env][data_id]["reward"]) if data_id in reward_cache[env] else 0
-                needed_number = max(0, pass_k - existing_number)
-                if needed_number == 0:
+            async def run_task_passes(task_data):
+                """Run attempts for one task sequentially with task-level early stop."""
+
+                data_id = hash(task_data)
+                task_cache = reward_cache[env].get(data_id)
+                existing_number = (
+                    len(task_cache.get("reward", []))
+                    if isinstance(task_cache, dict)
+                    else 0
+                )
+                existing_reports = (
+                    task_cache.get("reward_report", []) or []
+                    if isinstance(task_cache, dict)
+                    else []
+                )
+                if any(_is_successful_completion(report) for report in existing_reports):
+                    print(f"Data {data_id} already passed; task-level early stop")
+                    return []
+                if existing_number >= pass_k:
                     print(f"Data {data_id} already has enough rollouts, skipping...")
-                    continue
-                for _ in range(needed_number):
-                    reqs.append(
-                        limited_rollout(
-                            copy.deepcopy(d),
+                    return []
+
+                task_rewards = []
+                for attempt_index in range(existing_number, pass_k):
+                    task_rewards.append(
+                        await limited_rollout(
+                            copy.deepcopy(task_data),
                             client,
                             function,
                             args.temperature,
@@ -1779,11 +1857,24 @@ async def main():
                             args.include_think,
                             args.think_fallback,
                             args.require_think,
+                            pass_index=attempt_index + 1,
+                            user_model_client=user_client,
                         )
                     )
+                    if _is_successful_completion(task_rewards[-1].get("reward_report")):
+                        print(
+                            f"Data {data_id} passed on attempt {attempt_index + 1}; "
+                            "task-level early stop"
+                        )
+                        break
+                return task_rewards
 
-            # Run all rollout requests in parallel
-            rewards = await asyncio.gather(*reqs)
+            # Tasks may run concurrently, but their pass@k attempts never do:
+            # once one attempt succeeds, no later attempt for that task starts.
+            reward_groups = await asyncio.gather(
+                *(run_task_passes(d) for d in data)
+            )
+            rewards = [result for group in reward_groups for result in group]
 
             # Process the rewards
             for r in rewards:

@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class TrainingConfigTests(unittest.TestCase):
+    def test_travel_sft_uses_length_aware_batch_eight_for_three_epochs(self):
+        config = yaml.safe_load(
+            (ROOT / "verl" / "trainer" / "config" / "travel_qwen35_sft.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(config["data"]["train_batch_size"], 8)
+        self.assertEqual(config["data"]["micro_batch_size_per_gpu"], 1)
+        self.assertTrue(config["data"]["multiturn"]["dynamic_padding"])
+        self.assertTrue(config["data"]["multiturn"]["length_bucketing"])
+        self.assertEqual(config["data"]["multiturn"]["pad_to_multiple_of"], 128)
+        self.assertEqual(config["trainer"]["total_epochs"], 3)
+
+    def test_grpo_defaults(self):
+        config = yaml.safe_load(
+            (ROOT / "examples" / "sglang_multiturn" / "config" / "grpo_multiturn.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(config["data"]["train_batch_size"], 4)
+        self.assertTrue(config["algorithm"]["dynamic_sampling"]["enable"])
+        self.assertEqual(config["algorithm"]["dynamic_sampling"]["numerical_epsilon"], 1.0e-6)
+        self.assertEqual(config["algorithm"]["dynamic_sampling"]["min_reward_spread"], 5.0e-3)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["max_turns"], 25)
+        self.assertEqual(config["actor_rollout_ref"]["actor"]["clip_ratio_low"], 0.15)
+        self.assertEqual(config["actor_rollout_ref"]["actor"]["clip_ratio_high"], 0.25)
+        self.assertEqual(config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"], 2)
+        self.assertEqual(config["actor_rollout_ref"]["actor"]["optim"]["lr"], 3.0e-6)
+        self.assertEqual(config["trainer"]["experiment_profile"], "production")
+        self.assertTrue(config["trainer"]["initial_rollout_health_gate"])
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["response_token_buffer"], 0)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["max_new_tokens_per_turn"], 4096)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["max_reasoning_tokens_per_turn"], 2560)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["max_tool_call_tokens_per_turn"], 512)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["tool_response_token_reserve"], 6144)
+        self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["template_token_reserve"], 32)
+        self.assertEqual(config["trainer"]["total_training_steps"], 100)
+        self.assertEqual(config["trainer"]["milestones"], [20, 40, 60, 80, 100])
+        self.assertEqual(config["trainer"]["save_freq"], 20)
+
+    def test_grpo_launchers_share_the_project_python(self):
+        stage = (ROOT / "examples" / "sglang_multiturn" / "run_grpo_stage.sh").read_text()
+        train = (ROOT / "examples" / "sglang_multiturn" / "train.sh").read_text()
+        self.assertIn('.venv-grpo/bin/python', stage)
+        self.assertIn('PYTHON_BIN="$PYTHON_BIN"', stage)
+        self.assertIn('OVERFIT_ACTOR_LR:-3e-6', stage)
+        self.assertIn('actor_rollout_ref.actor.optim.lr="$overfit_actor_lr"', stage)
+        self.assertIn('.venv-grpo/bin/python', train)
+        self.assertIn('"$PYTHON_BIN" -m verl.trainer.main_ppo', train)
+        self.assertIn('data.train_batch_size=4', train)
+        self.assertIn('actor_rollout_ref.actor.ppo_mini_batch_size=2', train)
+        self.assertIn('actor_rollout_ref.actor.optim.lr=3e-6', train)
+        self.assertIn('data.max_prompt_length=1280', train)
+        self.assertIn('data.max_response_length=31488', train)
+        self.assertIn('check_grpo_prompt_budget.py', stage)
+        self.assertIn('PRODUCTION_EXPERIMENT_NAME', stage)
+        self.assertIn('PRODUCTION_SAVE_FREQ:-5', stage)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -81,6 +81,40 @@ vllm serve "$MERGED_MODEL_PATH" \
 `multi_turn.tool_call_parser` 也会在初始化时检查，避免静默退回 Hermes 等旧
 parser。
 
+## Native smoke20 / final200（SFT、GRPO 统一入口）
+
+策略模型的正式评测不要使用 `eval/eval.py` 的通用 HTTP rollout；它保留给
+Teacher/API 采集和离线诊断。正式 smoke20 与 final200 统一使用：
+
+```bash
+VALIDATION_MODEL_PATH=checkpoints/TravelGym/qwen35_4b_canonical_sft/merged_step_186 \
+  bash eval/native_validate.sh smoke20
+
+VALIDATION_MODEL_PATH=checkpoints/TravelGym/qwen35_4b_canonical_sft/merged_step_186 \
+  bash eval/native_validate.sh final200
+```
+
+两种模式共用原生 SGLang 多轮 rollout：模板预填 `<think>`，每个 assistant turn 的
+reasoning 上限 2560 token，遇到或强制补上 `</think>` 的关闭段 `loss_mask=0`，
+结构化 tool call 独立上限 512 token，`qwen3_coder` parser，merged SFT 使用
+`lora_rank=0`。评测固定为 task-level pass@3；某 task 任一 attempt 的
+`completion_success==1` 后立即停止该 task，其他 task 继续并发执行，且
+`validation_retry_attempts=0`，所以 attempt 不会被 retry 偷换。
+
+启动前入口会做 tokenizer/parser、GPU、prompt budget 和输出目录预检。过程日志中的
+`[validation-pass] attempt=... completed_tasks=...` 可实时查看已完成 task 数；结果和
+实际 attempt 数写入 `validation/0_pass3.jsonl` 与对应的 `_summary.json`，同一组标量
+也以 step 0 写入 SwanLab。smoke20 还会生成
+`outputs/travelgym_sft_step186_validation_baseline.json`，供后续 GRPO 默认复用；
+baseline schema 和公开 scalar 会被再次校验，已有文件拒绝覆盖。正式 GRPO 只读取这份
+step0 baseline，不在训练 validation 中重跑 pass@3；`validation_retry_attempts`、
+`attempt_count`、`early_stopped_tasks` 和 `valid_attempt_rate` 会与 pass@3 一起保留，
+避免把无效 rollout 或 early stop 隐藏在单一平均分中。
+
+原生入口固定 `OMP_NUM_THREADS=8` 并自动挂载可复用的 GRPO watcher；实时文件在
+`outputs/<experiment>/validation.log` 和 `outputs/<experiment>/monitor/`。需要手动
+控制关机时可设置 `GRPO_AUTO_SHUTDOWN=0`。
+
 ## final200 编排
 
 `eval/final200.py` 先校验 strict task-pool、Reward 版本和
@@ -100,5 +134,5 @@ SGLang/TravelGym 执行器注入 `evaluate_final200(plan, runner=..., tracking_f
 - `*_manifest.json`：协议、Reward 版本和采样配置 hash。
 
 交互 step reward 恒为 0，只有 episode 结束时计算
-`travelgym-terminal-v1`。含 API/环境故障的 rollout 标记
+`travelgym-terminal-v2`。含 API/环境故障的 rollout 标记
 `reward_valid_for_training=false`，由 SFT cleaner/GRPO trainer 隔离。

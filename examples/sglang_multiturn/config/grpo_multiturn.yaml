@@ -8,9 +8,9 @@ defaults:
 
 data:
   # The GRPO pool is the eligible sampling universe, not a coverage target.
-  # With train_batch_size=8 and 200 steps, the deterministic shuffled sampler
-  # consumes 1600 task draws from this pool without requiring a full pass.
-  train_batch_size: 8
+  # With train_batch_size=4 and 100 steps, the deterministic shuffled sampler
+  # consumes 400 task draws from this pool without requiring a full pass.
+  train_batch_size: 4
   seed: 20260801
   shuffle: true
   # The loader filters the aggregate parquet by the disjoint GRPO pool before
@@ -23,24 +23,39 @@ data:
   task_pool_require_strict: true
 
 algorithm:
-  # TravelGym emits one terminal score.  Turn credit is opt-in and disabled
-  # until conservation checks have passed in shadow mode.
-  action_credit_ratio: 0.8
-  turn_credit_stage: "off"
+  # Attribute terminal reward components to the turns that caused them. The
+  # training stage is enabled by default; set stage=off to opt out.
+  turn_credit:
+    method: component_attribution
+    stage: train
+    mix_ratio: 0.30
+    # Float64 trajectory-sum contract. Train mode fails fast if neither the
+    # absolute nor L1-normalized relative tolerance is met.
+    conservation_atol: 1.0e-5
+    conservation_rtol: 1.0e-6
+    routing:
+      causal_routing:
+        correct_completion: [0.15, 0.25, 0.60]
+        coverage_adjusted_answer_quality: [0.10, 0.35, 0.55]
+        coverage_adjusted_legal_chain_rate: [0.25, 0.35, 0.40]
   # Enable bounded dynamic resampling for GRPO.  The Hard Case Pool below is
   # still audit-only and must not trigger retries or sampler injection.
   dynamic_sampling:
     enable: true
     max_generation_batches: 3
     max_consecutive_skips: 10
-    reward_tolerance: 1.0e-6
+    # Numerical equality remains strict, while the semantic spread prevents
+    # tiny efficiency/preference deltas from becoming order-one normalized
+    # GRPO advantages. Start conservatively and compare 0.005 against 0.01.
+    numerical_epsilon: 1.0e-6
+    min_reward_spread: 5.0e-3
   # Passive audit only.  Groups admitted here are never re-sampled or added
   # to a batch; the JSON file is for later human inspection.
   hard_case_pool:
     enable: true
     threshold: 3
-    reward_version: travelgym-terminal-v1
-    path: checkpoints/TravelGym/hard_case_pool.json
+    reward_version: travelgym-terminal-v2
+    path: checkpoints/${trainer.project_name}/${trainer.experiment_name}/hard_case_pool.json
 
 actor_rollout_ref:
   model:
@@ -48,10 +63,18 @@ actor_rollout_ref:
     trust_remote_code: true
     enable_gradient_checkpointing: true
     use_remove_padding: true
-    lora_rank: 16
-    lora_alpha: 32
+    lora_rank: 32
+    lora_alpha: 64
   actor:
+    optim:
+      # Default GRPO actor learning rate.
+      lr: 1.0e-5
+    ppo_mini_batch_size: 2
     ppo_micro_batch_size_per_gpu: 1
+    # Asymmetric PPO clipping around the old/new policy ratio of 1.0.
+    clip_ratio: 0.2
+    clip_ratio_low: 0.15
+    clip_ratio_high: 0.25
   ref:
     log_prob_micro_batch_size_per_gpu: 1
   hybrid_engine: True
@@ -66,25 +89,66 @@ actor_rollout_ref:
       enable: True
       max_turns: 25
       model_name: gpt-4o
-      turn_level_method: "off"
+      turn_level_method: "component_attribution"
       trajectory_score_method: Terminal
       use_inference_chat_template: true
       enable_tokenization_sanity_check: true
       enable_thinking: true
+      # Extra ledger budget for serialized tool observations; does not change
+      # the per-turn generation cap (used only by the smoke workflow).
+      response_token_buffer: 0
+      # Bound each assistant turn and reserve room for the next native tool
+      # observation.  The cumulative response budget is enforced by rollout.
+      max_new_tokens_per_turn: 4096
+      # The native template opens <think>; reasoning is stopped/closed first,
+      # then a separate budget is used for the structured tool call.
+      max_reasoning_tokens_per_turn: 2560
+      max_tool_call_tokens_per_turn: 512
+      tool_response_token_reserve: 6144
+      template_token_reserve: 32
       # Verify this parser name against the installed SGLang build before
       # launching.  A mismatch must fail fast instead of silently selecting a
       # Hermes/legacy parser that changes Qwen3.5 tool-call tokenisation.
       tool_call_parser: qwen3_coder
       format: qwen
+    # Formal GRPO validation is one ordinary (greedy) attempt per task.
+    # pass@3 belongs only to the standalone native evaluation wrapper.
+    val_kwargs:
+      do_sample: false
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      n: 1
 
 trainer:
+  experiment_profile: production
+  initial_rollout_health_gate: true
+  # Formal GRPO does not use pass@3: one validation attempt is generated
+  # per task, with invalid interaction rows retried by the generic validator.
+  validation_retry_attempts: 2
+  validation_pass_k: 1
+  validation_task_level_early_stop: true
+  validation_baseline_output_path: null
+  val_only: false
+  # Diagnostic overfit jobs can disable all live and baseline Validation while
+  # retaining rollout, reward and checkpoint artifacts.
+  disable_validation: false
+  # Formal 20-step runs reuse the standalone SFT pass@3 baseline at step 0
+  # and run one ordinary smoke20 validation at the final milestone.
+  initial_validation_smoke: true
+  # Formal GRPO reuses the completed merged-SFT aggregate at step 0.  Set
+  # val_before_train=true explicitly only for a diagnostic live validation.
+  val_before_train: false
+  initial_validation_baseline_path: outputs/travelgym_sft_step186_validation_baseline.json
+  # Live milestone validation remains smoke20-only for the formal run.
   # SwanLab is supported by verl/utils/tracking.py. The launcher keeps a
   # TRAINER_LOGGER override for users who still want WandB or another backend.
   logger: ['console', 'swanlab']
   # The scheduler/optimizer horizon is fixed; run_until_step is process-local
-  # so 5 -> 50 -> 200 jobs can resume one run without changing LR state.
-  total_training_steps: 200
+  # so 20 -> 40 -> 60 -> 80 -> 100 jobs can resume one run without changing
+  # LR state.
+  total_training_steps: 100
   run_until_step: null
-  milestones: [5, 50, 100, 150, 200]
+  milestones: [20, 40, 60, 80, 100]
   save_freq: 20
   wait_for_selected_grpo_checkpoint: true

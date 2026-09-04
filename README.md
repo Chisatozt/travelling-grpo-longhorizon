@@ -19,7 +19,7 @@ UserRL enables training language models to interact effectively with users acros
 
 - **Multi-Turn Conversations**: Support for complex, extended dialogues with proper credit assignment
 - **TravelGym Environment**: Multi-aspect travel planning with hidden user preferences
-- **Terminal Reward GRPO**: GRPO over the TravelGym terminal score; turn credit is opt-in
+- **Terminal Reward GRPO**: GRPO over the TravelGym terminal score; behavior-component TurnCredit is enabled by default
 - **Scalable Training**: Multi-GPU support with SGLang backend for efficient inference
 - **End-to-End Evaluation**: Terminal-only TravelGym scoring and protocol diagnostics
 
@@ -40,9 +40,9 @@ UserRL/
 ### Key Features
 
 - **🤖 TravelGym Training**: Train on multi-aspect travel recommendation tasks
-- **🎯 Optional Turn Credit**: Conservation-checked redistribution after terminal GRPO advantages
+- **🎯 TurnCredit**: Conservation-checked redistribution after terminal GRPO advantages; enabled by default
 - **⚡ Efficient Inference**: SGLang backend with optimized memory utilization
-- **📊 Comprehensive Logging**: WandB integration with detailed metrics tracking
+- **📊 Comprehensive Logging**: SwanLab tracks final Reward and every public Reward component
 - **🔧 Flexible Configuration**: Hydra-based configuration system for easy experimentation
 
 ## 🚀 Quick Start
@@ -150,7 +150,6 @@ their CoT and tool call), and partial-correct rows carry weight 0.5.  See
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
-  --config-path=verl/trainer/config \
   --config-name=travel_qwen35_sft \
   trainer.n_gpus_per_node=1 \
   model.partial_pretrain=Qwen/Qwen3.5-4B
@@ -161,9 +160,9 @@ torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
 **Key Training Parameters:**
 
 - **Algorithm**: GRPO with terminal-only TravelGym reward
-- **Turn-Level Credit**: disabled by default; enable only through `off -> shadow -> train` after conservation checks
+- **Turn-Level Credit**: behavior-component attribution runs in `train` by default; set `algorithm.turn_credit.stage=off` to disable it
 - **Trajectory Scoring**: terminal scalar (no per-step reward averaging)
-- **Dynamic Resampling**: bounded dynamic resampling enabled by default; the Hard Case Pool remains audit-only
+- **Dynamic Resampling**: bounded dynamic resampling enabled by default; numerical equality uses `1e-6`, while the minimum meaningful terminal-reward spread is `0.005`; the Hard Case Pool remains audit-only
 - **Hard Case Pool**: trainer-private, append-only audit of three consecutive valid all-zero rollout groups; no resampling or training injection
 
 **Training Configuration Example:**
@@ -173,14 +172,22 @@ torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
 algorithm.adv_estimator: grpo_multiturn
 algorithm.gamma: 0.8
 algorithm.dynamic_sampling.enable: true
-data.train_batch_size: 8
-actor_rollout_ref.actor.ppo_mini_batch_size: 4
+data.train_batch_size: 4
+actor_rollout_ref.actor.ppo_mini_batch_size: 2
+actor_rollout_ref.actor.optim.lr: 1e-5
+actor_rollout_ref.actor.clip_ratio_low: 0.15
+actor_rollout_ref.actor.clip_ratio_high: 0.25
 actor_rollout_ref.rollout.n: 4
 actor_rollout_ref.rollout.multi_turn.max_turns: 25
-actor_rollout_ref.rollout.multi_turn.turn_level_method: "off"
+actor_rollout_ref.rollout.multi_turn.turn_level_method: "component_attribution"
 actor_rollout_ref.rollout.multi_turn.trajectory_score_method: "Terminal"
-algorithm.turn_credit_stage: off
+algorithm.turn_credit.stage: train
+actor_rollout_ref.model.lora_rank: 32
+actor_rollout_ref.model.lora_alpha: 64
+OMP_NUM_THREADS: 8
 trainer.save_freq: 20
+trainer.total_training_steps: 100
+trainer.milestones: [20, 40, 60, 80, 100]
 ```
 
 ### 3. Model Evaluation
@@ -266,8 +273,12 @@ trainer.test_freq: 5
 SwanLab is the default monitoring backend for the TravelGym launchers. Set
 `SWANLAB_API_KEY` in the repository `.env` for online cloud syncing; use
 `SWANLAB_MODE=local` or `offline` when the training server has no network.
-`TRAINER_LOGGER=wandb` remains available as an explicit compatibility
-override.
+Each step logs `grpo/*/reward/final` and the public terminal-reward components
+under `grpo/*/reward/components/*`. The launchers also arm
+`scripts/grpo_shutdown_watcher.py` by default; live logs are under the run's
+`training.log` and `monitor/`, and `GRPO_AUTO_SHUTDOWN=0` disables poweroff for
+a deliberate manual run. `TRAINER_LOGGER=wandb` remains available as an
+explicit compatibility override.
 
 ## 🤝 Contributing
 

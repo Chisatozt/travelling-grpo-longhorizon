@@ -18,6 +18,12 @@ class Final200PlanTests(unittest.TestCase):
         self.assertEqual(len(plan["splits"]["smoke20_seen"]), 20)
         self.assertEqual(len(plan["splits"]["unseen180"]), 180)
         self.assertEqual(plan["models"]["grpo"], "ckpt")
+        self.assertEqual(plan["protocol"]["pass_k"], 3)
+        self.assertTrue(plan["protocol"]["task_level_early_stop"])
+        self.assertTrue(plan["protocol"]["native_two_stage"])
+        self.assertEqual(plan["protocol"]["template_prefill"], "<think>")
+        self.assertEqual(plan["protocol"]["reasoning_max_tokens_per_turn"], 2560)
+        self.assertEqual(plan["protocol"]["tool_call_max_tokens_per_turn"], 512)
 
     def test_missing_selection_is_blocked(self):
         with self.assertRaises(Final200Error):
@@ -89,6 +95,39 @@ class Final200PlanTests(unittest.TestCase):
         self.assertIn("all/base_terminal_reward", [
             key for key, _value in result["comparison"].items()
         ])
+        self.assertEqual(result["models"]["base"]["all"]["pass_at_k"], 1.0)
+        self.assertEqual(result["models"]["base"]["all"]["attempt_count"], 200.0)
+
+    def test_final200_stops_each_task_after_second_attempt(self):
+        plan = build_final200_plan(
+            task_pool_manifest=self.pool,
+            smoke_manifest=self.smoke,
+            models=self.models,
+            seed=1,
+            max_turns=25,
+            selected_grpo_checkpoint="ckpt",
+        )
+        calls = []
+
+        def runner(*, model_name, task_key, protocol):
+            calls.append((model_name, task_key, protocol["attempt"]))
+            success = 1.0 if protocol["attempt"] == 2 else 0.0
+            return {
+                "terminal_reward": success,
+                "completion_success": success,
+                "correct_completion": success,
+                "best_answer_rate": success,
+                "answer_coverage": success,
+                "legal_chain_rate": success,
+                "efficiency": 0.5,
+            }
+
+        result = evaluate_final200(plan, runner=runner)
+        self.assertEqual(len(calls), 4 * 200 * 2)
+        self.assertEqual(result["models"]["base"]["all"]["pass_at_k"], 1.0)
+        self.assertEqual(result["models"]["base"]["all"]["attempt_count"], 400.0)
+        self.assertEqual(result["models"]["base"]["all"]["early_stopped_tasks"], 200.0)
+        self.assertEqual(result["models"]["base"]["all"]["completion_success_count"], 200.0)
 
 
 if __name__ == "__main__":

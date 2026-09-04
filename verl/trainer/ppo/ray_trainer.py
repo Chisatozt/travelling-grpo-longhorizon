@@ -27,7 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Optional, Type
+from typing import Any, Optional, Type
 
 import numpy as np
 import ray
@@ -46,11 +46,22 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_reward_component_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.validation_baseline import (
+    ValidationBaselineError,
+    load_step0_validation_metrics,
+    resolve_validation_baseline_path,
+)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.rollout_health import validate_initial_rollout_health
+from verl.trainer.ppo.validation_passes import (
+    PUBLIC_VALIDATION_METRICS,
+    aggregate_validation_attempts,
+)
 from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager, find_latest_ckpt_path, get_best_score
 from verl.utils.debug.performance import _timer
 from verl.utils.metric import (
@@ -63,6 +74,7 @@ from verl.trainer.ppo.experiment_integrity import (
     ExperimentIntegrityError,
     capture_rng_state,
     restore_rng_state,
+    resolve_training_step_policy,
     validate_process_run_until_step,
     validate_total_training_steps,
 )
@@ -276,6 +288,164 @@ def _extract_terminal_reward_metadata(data: DataProto):
     return torch.tensor(values, device=device, dtype=dtype), torch.tensor(valid, device=device, dtype=torch.bool)
 
 
+_TERMINAL_REWARD_COMPONENT_SPECS = (
+    ("correct_completion", 3.00),
+    ("coverage_adjusted_answer_quality", 0.30),
+    ("coverage_adjusted_legal_chain_rate", 0.20),
+    ("hidden_preference_hit_rate", 0.15),
+    ("efficiency", 0.05),
+    ("policy_penalty", -1.00),
+    ("redundant_action_penalty", -1.00),
+    ("incomplete_penalty", -1.00),
+    ("zero_answer_penalty", -1.00),
+    ("max_steps_penalty", -1.00),
+)
+
+
+def _extract_terminal_reward_components(
+    data: DataProto,
+    terminal_scores: torch.Tensor,
+) -> tuple[tuple[str, ...], torch.Tensor] | None:
+    """Reconstruct the exact TravelGym terminal score as signed components."""
+    batch_size = int(terminal_scores.numel())
+    reward_versions = data.non_tensor_batch.get("reward_version")
+    if reward_versions is None:
+        return None
+    versions = np.asarray(reward_versions, dtype=object).reshape(-1)
+    if versions.size != batch_size or any(
+        str(version) != "travelgym-terminal-v2" for version in versions
+    ):
+        return None
+    columns = []
+    names = []
+    for name, coefficient in _TERMINAL_REWARD_COMPONENT_SPECS:
+        raw = data.non_tensor_batch.get(name)
+        if raw is None:
+            return None
+        try:
+            values = np.asarray(raw, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if values.size != batch_size or not np.isfinite(values).all():
+            return None
+        names.append(name)
+        columns.append(
+            torch.tensor(
+                values,
+                device=terminal_scores.device,
+                dtype=terminal_scores.dtype,
+            )
+            * (float(coefficient) / 3.70)
+        )
+    components = torch.stack(columns, dim=-1)
+    # terminal_reward is clipped to [-1, 1]. Keep clipping as an explicit
+    # residual so component sums remain exactly equal to the optimized score.
+    clip_residual = terminal_scores.reshape(-1) - components.sum(dim=-1)
+    components = torch.cat([components, clip_residual.unsqueeze(-1)], dim=-1)
+    return tuple(names) + ("clip_residual",), components
+
+
+def _aligned_reward_extra_info_arrays(
+    reward_extra_infos: Mapping[str, list],
+    *,
+    batch_size: int,
+) -> dict[str, np.ndarray]:
+    """Convert row-wise diagnostics only after proving batch alignment."""
+    arrays: dict[str, np.ndarray] = {}
+    mismatches: list[str] = []
+    for key, values in reward_extra_infos.items():
+        try:
+            actual = len(values)
+        except TypeError:
+            actual = -1
+        if actual != batch_size:
+            mismatches.append(f"{key}={actual}")
+            continue
+        arrays[key] = np.asarray(values)
+    if mismatches:
+        details = ", ".join(sorted(mismatches))
+        raise ValueError(
+            "reward metadata must contain exactly one value per trajectory: "
+            f"batch_size={batch_size}; mismatched lengths: {details}"
+        )
+    return arrays
+
+
+def _apply_turn_credit_stage(
+    original_advantages: torch.Tensor,
+    credited_advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    diagnostics: dict[str, float],
+    *,
+    stage: str,
+    conservation_atol: float = 1.0e-5,
+    conservation_rtol: float = 1.0e-6,
+) -> torch.Tensor:
+    """Select train or shadow advantages with a strict conservation contract."""
+    if stage not in {"shadow", "train"}:
+        raise ValueError(f"turn credit application requires shadow/train stage, got {stage}")
+    if (
+        not np.isfinite(conservation_atol)
+        or not np.isfinite(conservation_rtol)
+        or conservation_atol < 0
+        or conservation_rtol < 0
+    ):
+        raise ValueError("turn credit conservation tolerances must be finite and non-negative")
+
+    conservation = core_algos.turn_credit_conservation_stats(
+        original_advantages,
+        credited_advantages,
+        response_mask,
+    )
+    abs_error = float(conservation["absolute_error"].detach().cpu())
+    relative_error = float(conservation["relative_error"].detach().cpu())
+    mean_token_error = float(conservation["mean_token_error"].detach().cpu())
+    finite = bool(conservation["finite"].detach().cpu())
+    diagnostics.update(
+        {
+            "conservation_error": abs_error,
+            "conservation_abs_error": abs_error,
+            "conservation_relative_error": relative_error,
+            "conservation_mean_token_error": mean_token_error,
+            "conservation_finite": float(finite),
+            "conservation_atol": float(conservation_atol),
+            "conservation_rtol": float(conservation_rtol),
+            "applied": 0.0,
+        }
+    )
+
+    if stage == "shadow":
+        return original_advantages
+    fallback_rows = int(diagnostics.get("fallback_row_count", 0.0))
+    if fallback_rows:
+        raise ValueError(
+            "component turn credit is in train mode but quality events are missing "
+            f"for {fallback_rows} rollout row(s)"
+        )
+    preprojection_abs_error = float(diagnostics.get("preprojection_abs_error", abs_error))
+    preprojection_relative_error = float(
+        diagnostics.get("preprojection_relative_error", relative_error)
+    )
+    preprojection_finite = bool(diagnostics.get("preprojection_finite", finite))
+    final_conserved = finite and (
+        abs_error <= conservation_atol or relative_error <= conservation_rtol
+    )
+    preprojection_conserved = preprojection_finite and (
+        preprojection_abs_error <= conservation_atol
+        or preprojection_relative_error <= conservation_rtol
+    )
+    if not (preprojection_conserved and final_conserved):
+        raise RuntimeError(
+            "turn credit conservation failed in train mode: "
+            f"preprojection_abs_error={preprojection_abs_error:.9g}, "
+            f"preprojection_relative_error={preprojection_relative_error:.9g}, "
+            f"final_abs_error={abs_error:.9g} (atol={conservation_atol:.9g}), "
+            f"final_relative_error={relative_error:.9g} (rtol={conservation_rtol:.9g})"
+        )
+    diagnostics["applied"] = 1.0
+    return credited_advantages
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, turn_level_method="Equalized", trajectory_score_method="Sum", norm_adv_by_std_in_grpo=True, config=None):
     """Compute advantage estimates for policy optimization.
 
@@ -289,7 +459,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
         num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
         multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
-        turn_level_method (str, optional): Method to assign credits to turns, "Equalized" or "R2G" or "EM". Defaults to "Equalized".
+        turn_level_method (str, optional): Legacy method selector; behavior-component routing is configured under algorithm.turn_credit.
         trajectory_score_method (str, optional): Method to compute trajectory score, "Sum" or "R2G". Defaults to "Sum".
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in GRPO. Defaults to True.
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
@@ -329,13 +499,21 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
         terminal_scores, reward_valid = _extract_terminal_reward_metadata(data)
         if terminal_scores is not None:
-            from verl.trainer.ppo.dynamic_sampling import select_reward_varying_groups
+            from verl.trainer.ppo.dynamic_sampling import (
+                resolve_reward_spread_thresholds,
+                select_reward_varying_groups,
+            )
             expected_group_size = max(2, int(num_repeat or 1))
+            numerical_epsilon, min_reward_spread = resolve_reward_spread_thresholds(
+                (config or {}).get("dynamic_sampling", {})
+            )
             kept_indices, sampling_stats = select_reward_varying_groups(
                 data.non_tensor_batch["uid"],
                 terminal_scores.detach().cpu().tolist(),
                 reward_valid=reward_valid.detach().cpu().tolist(),
                 expected_group_size=expected_group_size,
+                numerical_epsilon=numerical_epsilon,
+                min_reward_spread=min_reward_spread,
             )
             if data.meta_info.get("travel_skip_update", False):
                 kept_indices = []
@@ -372,13 +550,21 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
         terminal_scores, reward_valid = _extract_terminal_reward_metadata(data)
         if terminal_scores is not None:
-            from verl.trainer.ppo.dynamic_sampling import select_reward_varying_groups
+            from verl.trainer.ppo.dynamic_sampling import (
+                resolve_reward_spread_thresholds,
+                select_reward_varying_groups,
+            )
             expected_group_size = max(2, int(num_repeat or 1))
+            numerical_epsilon, min_reward_spread = resolve_reward_spread_thresholds(
+                (config or {}).get("dynamic_sampling", {})
+            )
             kept_indices, sampling_stats = select_reward_varying_groups(
                 data.non_tensor_batch["uid"],
                 terminal_scores.detach().cpu().tolist(),
                 reward_valid=reward_valid.detach().cpu().tolist(),
                 expected_group_size=expected_group_size,
+                numerical_epsilon=numerical_epsilon,
+                min_reward_spread=min_reward_spread,
             )
             if data.meta_info.get("travel_skip_update", False):
                 kept_indices = []
@@ -400,26 +586,107 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             returns = returns * train_mask.unsqueeze(-1)
             # Turn credit is strictly opt-in and runs only after terminal
             # group-relative advantages have been determined.
-            turn_mode = str(turn_level_method or "off")
-            credit_stage = str((config or {}).get("turn_credit_stage", "off")).casefold()
+            turn_credit_config = (config or {}).get("turn_credit", {})
+            if not isinstance(turn_credit_config, Mapping):
+                turn_credit_config = {}
+            turn_mode = str(
+                turn_credit_config.get("method", turn_level_method or "off")
+            )
+            credit_stage = str(
+                turn_credit_config.get(
+                    "stage",
+                    (config or {}).get("turn_credit_stage", "off"),
+                )
+            ).casefold()
+            valid_turn_modes = {
+                "off",
+                "none",
+                "equalized",
+                "r2g",
+                "em",
+                "component_attribution",
+                "behavior_component",
+                "behavior_delta",
+            }
+            if turn_mode.casefold() not in valid_turn_modes:
+                raise ValueError(f"invalid turn credit method: {turn_mode}")
+            if credit_stage not in {"off", "shadow", "train"}:
+                raise ValueError(f"invalid turn credit stage: {credit_stage}")
             if turn_mode.casefold() not in {"off", "none"} and credit_stage in {"shadow", "train"}:
                 histories = data.non_tensor_batch.get("conversation_histories", [])
                 if hasattr(histories, "tolist"):
                     histories = histories.tolist()
                 histories = [h[0] if isinstance(h, list) and len(h) == 1 else h for h in histories]
-                credited_advantages = core_algos.redistribute_terminal_turn_credit(
+                if turn_mode.casefold() in {
+                    "component_attribution",
+                    "behavior_component",
+                    "behavior_delta",
+                }:
+                    component_payload = _extract_terminal_reward_components(
+                        data,
+                        terminal_scores,
+                    )
+                    if component_payload is None:
+                        if credit_stage == "train":
+                            raise ValueError(
+                                "component turn credit requires complete TravelGym reward metadata"
+                            )
+                        credited_advantages = advantages
+                        diagnostics = {"component_metadata_missing": 1.0}
+                    else:
+                        component_names, reward_components = component_payload
+                        component_advantages = core_algos.compute_terminal_component_advantages(
+                            terminal_scores,
+                            reward_components,
+                            data.non_tensor_batch["uid"],
+                            reward_valid=reward_valid,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        )
+                        component_advantages = component_advantages * train_mask.unsqueeze(-1)
+                        routing = turn_credit_config.get("routing", {})
+                        if OmegaConf.is_config(routing):
+                            routing = OmegaConf.to_container(routing, resolve=True)
+                        credited_advantages, diagnostics = (
+                            core_algos.redistribute_behavior_component_turn_credit(
+                                advantages,
+                                grpo_calculation_mask,
+                                data.batch["turn_boundaries"],
+                                histories,
+                                component_advantages,
+                                component_names,
+                                mix_ratio=float(turn_credit_config.get("mix_ratio", 0.30)),
+                                routing=routing,
+                            )
+                        )
+                else:
+                    credited_advantages = core_algos.redistribute_terminal_turn_credit(
+                        advantages,
+                        grpo_calculation_mask,
+                        data.batch["turn_boundaries"],
+                        histories,
+                    )
+                    diagnostics = {
+                        "conservation_error": float(
+                            core_algos.turn_credit_conservation_error(
+                                advantages,
+                                credited_advantages,
+                                grpo_calculation_mask,
+                            ).detach().cpu()
+                        )
+                    }
+                advantages = _apply_turn_credit_stage(
                     advantages,
+                    credited_advantages,
                     grpo_calculation_mask,
-                    data.batch["turn_boundaries"],
-                    histories,
+                    diagnostics,
+                    stage=credit_stage,
+                    conservation_atol=float(turn_credit_config.get("conservation_atol", 1.0e-5)),
+                    conservation_rtol=float(turn_credit_config.get("conservation_rtol", 1.0e-6)),
                 )
-                conservation_error = core_algos.turn_credit_conservation_error(
-                    advantages, credited_advantages, grpo_calculation_mask
-                )
-                data.meta_info["turn_credit_conservation_error"] = float(conservation_error.detach().cpu())
-                if credit_stage == "train" and float(conservation_error.detach().cpu()) <= 1.0e-5:
-                    advantages = credited_advantages
-                    returns = advantages.clone()
+                returns = advantages.clone()
+                data.meta_info["turn_credit_conservation_error"] = diagnostics["conservation_abs_error"]
+                data.meta_info["turn_credit_applied"] = diagnostics["applied"]
+                data.meta_info["turn_credit_diagnostics"] = diagnostics
         else:
             # Generic non-terminal batches retain the ordinary API; the
             # TravelGym path above computes terminal-only scores.
@@ -528,7 +795,7 @@ class RayPPOTrainer:
             self.hard_case_pool = HardCasePool(
                 pool_path,
                 threshold=int(hard_case_config.get("threshold", 3)),
-                reward_version=str(hard_case_config.get("reward_version", "travelgym-terminal-v1")),
+                reward_version=str(hard_case_config.get("reward_version", "travelgym-terminal-v2")),
                 enabled=True,
                 rank=0,
             )
@@ -687,8 +954,41 @@ class RayPPOTrainer:
             print("WARNING: val_batch_size is deprecated." + " Validation datasets are sent to inference engines as a whole batch," + " which will schedule the memory themselves.")
 
         # check eval config
-        if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
-            assert config.actor_rollout_ref.rollout.temperature > 0, "validation gen temperature should be greater than 0 when enabling do_sample"
+        try:
+            validation_pass_k = int(config.trainer.get("validation_pass_k", 1))
+        except (TypeError, ValueError) as exc:
+            raise ExperimentIntegrityError(
+                "trainer.validation_pass_k must be a positive integer"
+            ) from exc
+        if validation_pass_k < 1:
+            raise ExperimentIntegrityError(
+                "trainer.validation_pass_k must be a positive integer"
+            )
+        if bool(config.trainer.get("val_only", False)) and int(
+            config.trainer.get("validation_retry_attempts", 0)
+        ):
+            raise ExperimentIntegrityError(
+                "trainer.val_only cannot combine validation_retry_attempts; "
+                "pass@k attempts must be independent"
+            )
+        val_kwargs = config.actor_rollout_ref.rollout.val_kwargs
+        validation_do_sample = bool(val_kwargs.get("do_sample", False))
+        if validation_do_sample:
+            try:
+                validation_temperature = float(val_kwargs.get("temperature", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise ExperimentIntegrityError(
+                    "validation sampling temperature must be a positive finite number"
+                ) from exc
+            if not np.isfinite(validation_temperature) or validation_temperature <= 0:
+                raise ExperimentIntegrityError(
+                    "validation sampling temperature must be a positive finite number"
+                )
+        if validation_pass_k > 1 and not validation_do_sample:
+            raise ExperimentIntegrityError(
+                "task-level pass@k validation requires val_kwargs.do_sample=true "
+                "so attempts are independent"
+            )
 
         # check multi_turn with tool config
         if config.actor_rollout_ref.rollout.multi_turn.enable:
@@ -770,18 +1070,27 @@ class RayPPOTrainer:
 
         print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {len(self.val_dataloader)}")
 
-        # Optimizer/LR schedules always use the experiment-wide 200 steps.
-        # ``run_until_step`` only bounds this process (5/50/200) and must not
-        # alter scheduler state when a later process resumes.
+        # Production and the two overfit diagnostics have separate, fixed
+        # optimizer horizons and legal process stop points.
+        (
+            self.training_profile,
+            expected_total_steps,
+            self.allowed_run_until_steps,
+        ) = resolve_training_step_policy(
+            self.config.trainer.get("experiment_profile", "production")
+        )
         total_training_steps = validate_total_training_steps(
-            self.config.trainer.get("total_training_steps", None), expected=200
+            self.config.trainer.get("total_training_steps", None),
+            expected=expected_total_steps,
         )
         self.run_until_step = validate_process_run_until_step(
             self.config.trainer.get("run_until_step", None),
             total_training_steps=total_training_steps,
-            allowed_steps=(5, 50, 200),
+            allowed_steps=self.allowed_run_until_steps,
         )
-        configured_milestones = self.config.trainer.get("milestones", [5, 50, 100, 150, 200])
+        configured_milestones = self.config.trainer.get(
+            "milestones", list(self.allowed_run_until_steps)
+        )
         self.milestones = sorted({int(value) for value in configured_milestones if 0 < int(value) <= total_training_steps})
         configured_save_freq = self.config.trainer.get("save_freq", -1)
         try:
@@ -858,6 +1167,519 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _generate_validation_batch_once(self, test_gen_batch: DataProto):
+        """Generate exactly one validation response for every input row.
+
+        This helper is deliberately separate from invalid-row retries.  A
+        pass@k evaluator must count each fresh generation as an attempt; a
+        retry inside one attempt would silently change the denominator.
+        """
+        padded_batch, pad_size = pad_dataproto_to_divisor(
+            test_gen_batch, self.actor_rollout_wg.world_size
+        )
+        if not self.async_rollout_mode:
+            padded_output = self.actor_rollout_wg.generate_sequences(padded_batch)
+        else:
+            self.async_rollout_manager.wake_up()
+            try:
+                padded_output = self.async_rollout_manager.generate_sequences(
+                    padded_batch
+                )
+            finally:
+                self.async_rollout_manager.sleep()
+        generated = unpad_dataproto(padded_output, pad_size=pad_size)
+        if len(generated) != len(test_gen_batch):
+            raise ExperimentIntegrityError(
+                "validation rollout changed the task-row count: "
+                f"requested={len(test_gen_batch)}, generated={len(generated)}"
+            )
+        # Rollout diagnostics are trainer-private training metrics.  A
+        # validation output is unioned with its source batch, whose meta_info
+        # must remain stable across attempts/batches; retaining per-rollout
+        # timing/length values would make that union fail on the next attempt.
+        generated.meta_info.pop("timing", None)
+        generated.meta_info.pop("travel_rollout_length", None)
+        return generated
+
+    def _generate_validation_batch_with_retries(self, test_gen_batch: DataProto):
+        """Retry invalid interaction rows with fresh validation rollouts."""
+        max_retries = max(
+            0, int(self.config.trainer.get("validation_retry_attempts", 0))
+        )
+        output = None
+        pending_indices = list(range(len(test_gen_batch)))
+        pending_batch = test_gen_batch
+        initial_invalid_rows = 0
+        retried_rows = 0
+        final_invalid_rows = 0
+
+        for attempt in range(max_retries + 1):
+            generated = self._generate_validation_batch_once(pending_batch)
+
+            if output is None:
+                output = generated
+            else:
+                for key in output.batch.keys():
+                    output.batch[key][pending_indices] = generated.batch[key]
+                for key in output.non_tensor_batch:
+                    output.non_tensor_batch[key][pending_indices] = (
+                        generated.non_tensor_batch[key]
+                    )
+
+            _, reward_valid = _extract_terminal_reward_metadata(output)
+            if reward_valid is None:
+                # Generic validation has no interaction validity contract.
+                pending_indices = []
+                break
+            pending_indices = (
+                (~reward_valid).nonzero(as_tuple=False).flatten().cpu().tolist()
+            )
+            final_invalid_rows = len(pending_indices)
+            if attempt == 0:
+                initial_invalid_rows = final_invalid_rows
+            if not pending_indices or attempt == max_retries:
+                break
+
+            retried_rows += len(pending_indices)
+            print(
+                "[validation-retry] "
+                f"retry={attempt + 1}/{max_retries} "
+                f"invalid_rows={len(pending_indices)}"
+            )
+            pending_batch = test_gen_batch.select_idxs(pending_indices)
+
+        if output is None:
+            raise RuntimeError("validation generation produced no output")
+        stats = {
+            "retried_rows": retried_rows,
+            "recovered_rows": initial_invalid_rows - final_invalid_rows,
+            "final_invalid_rows": final_invalid_rows,
+        }
+        if retried_rows or final_invalid_rows:
+            print(f"[validation-retry] summary={stats}")
+        return output, stats
+
+    @staticmethod
+    def _validation_values(batch: DataProto, key: str) -> list:
+        values = batch.non_tensor_batch.get(key)
+        if values is None:
+            return []
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        return list(values)
+
+    @classmethod
+    def _validation_task_keys(cls, batch: DataProto) -> list[str]:
+        """Return strict task identities for task-level pass accounting."""
+        task_ids = cls._validation_values(batch, "task_id")
+        if not task_ids:
+            reward_models = cls._validation_values(batch, "reward_model")
+            task_ids = [
+                item.get("id") if isinstance(item, Mapping) else None
+                for item in reward_models
+            ]
+        if len(task_ids) != len(batch):
+            raise ExperimentIntegrityError(
+                "task-level validation requires one reward_model.id/task_id per row: "
+                f"rows={len(batch)}, task_ids={len(task_ids)}"
+            )
+
+        env_names = cls._validation_values(batch, "_travel_source_env_name")
+        if env_names and len(env_names) != len(batch):
+            raise ExperimentIntegrityError(
+                "validation task provenance is misaligned: "
+                f"rows={len(batch)}, env_names={len(env_names)}"
+            )
+
+        task_keys: list[str] = []
+        seen: set[str] = set()
+        for index, raw_task_id in enumerate(task_ids):
+            if isinstance(raw_task_id, Mapping):
+                raw_task_id = raw_task_id.get("id")
+            task_id = str(raw_task_id or "").strip()
+            if not task_id:
+                raise ExperimentIntegrityError(
+                    f"validation row {index} has no stable task identity"
+                )
+            env_name = ""
+            if env_names:
+                env_name = str(env_names[index] or "").strip()
+            task_key = f"{env_name}::{task_id}" if env_name else task_id
+            if task_key in seen:
+                raise ExperimentIntegrityError(
+                    f"validation batch contains duplicate task identity {task_key!r}"
+                )
+            seen.add(task_key)
+            task_keys.append(task_key)
+        return task_keys
+
+    def _prepare_validation_generation(self, test_batch: DataProto):
+        input_ids = test_batch.batch["input_ids"]
+        input_texts = [
+            self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids
+        ]
+        batch_keys_to_pop = [
+            key for key in ("input_ids", "attention_mask", "position_ids")
+            if key in test_batch.batch.keys()
+        ]
+        non_tensor_batch_keys_to_pop = [
+            key
+            for key in (
+                "raw_prompt_ids",
+                "_travel_source_env_name",
+                "multi_modal_data",
+                "raw_prompt",
+                "tools_kwargs",
+            )
+            if key in test_batch.non_tensor_batch
+        ]
+        test_gen_batch = test_batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+        test_gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+            "validate": True,
+        }
+        print(f"validation pass meta info: {test_gen_batch.meta_info}")
+        return input_texts, test_gen_batch
+
+    @staticmethod
+    def _public_validation_scalar(value: Any):
+        while isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except (TypeError, ValueError):
+                pass
+        if isinstance(value, (str, bool, int, float)):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        return str(value)
+
+    @staticmethod
+    def _validation_number(value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if np.isfinite(number) else default
+
+    def _dump_validation_passes(
+        self,
+        records: list[Mapping[str, Any]],
+        summary: Mapping[str, Any],
+        dump_path: str,
+        *,
+        pass_k: int,
+        smoke: bool,
+        early_stop: bool,
+    ) -> None:
+        os.makedirs(dump_path, exist_ok=True)
+        prefix = f"{self.global_steps}_pass{pass_k}"
+        generations_path = os.path.join(dump_path, f"{prefix}.jsonl")
+        allowed = set(PUBLIC_VALIDATION_METRICS) | {
+            "task_id",
+            "attempt",
+            "input",
+            "output",
+            "score",
+            "reward_valid",
+            "reward_version",
+        }
+        with open(generations_path, "w", encoding="utf-8") as handle:
+            for record in records:
+                payload = {
+                    key: self._public_validation_scalar(value)
+                    for key, value in record.items()
+                    if key in allowed
+                }
+                payload["step"] = int(self.global_steps)
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        multi_turn_config = rollout_config.get("multi_turn", {})
+        protocol = {
+            "schema_version": "travelgym-native-validation-v1",
+            "backend": str(rollout_config.get("name", "unknown")),
+            "native_two_stage": bool(multi_turn_config.get("enable", False)),
+            "template_prefill": "<think>" if bool(multi_turn_config.get("enable_thinking", False)) else "",
+            "reasoning_max_tokens": int(multi_turn_config.get("max_reasoning_tokens_per_turn", 0)),
+            "tool_call_max_tokens": int(multi_turn_config.get("max_tool_call_tokens_per_turn", 0)),
+            "max_new_tokens_per_turn": int(multi_turn_config.get("max_new_tokens_per_turn", 0)),
+            "tool_response_token_reserve": int(multi_turn_config.get("tool_response_token_reserve", 0)),
+            "template_token_reserve": int(multi_turn_config.get("template_token_reserve", 0)),
+            "tool_call_parser": str(multi_turn_config.get("tool_call_parser", "")),
+            "do_sample": bool(rollout_config.val_kwargs.get("do_sample", False)),
+            "temperature": float(rollout_config.val_kwargs.get("temperature", 0.0)),
+            "top_p": float(rollout_config.val_kwargs.get("top_p", 1.0)),
+            "top_k": int(rollout_config.val_kwargs.get("top_k", -1)),
+            "forced_reasoning_end": True,
+            "forced_reasoning_end_loss_mask": 0,
+            "pass_k": int(pass_k),
+            "task_level_early_stop": bool(early_stop),
+            "validation_retry_attempts": 0,
+            "split": "validation_smoke" if smoke else "validation",
+            "eos_token_id": int(self.tokenizer.eos_token_id),
+            "pad_token_id": int(self.tokenizer.pad_token_id),
+        }
+        summary_path = os.path.join(dump_path, f"{prefix}_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": "travelgym-validation-pass-summary-v1",
+                    "step": int(self.global_steps),
+                    "protocol": protocol,
+                    "summary": dict(summary),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+
+        # The corrected SFT smoke20 result can be consumed directly by the
+        # formal GRPO launcher as its immutable step-0 baseline.  Keep this
+        # opt-in and fail closed on an existing target so an old/generic HTTP
+        # result cannot be silently replaced or silently reused.
+        baseline_output_path = self.config.trainer.get(
+            "validation_baseline_output_path", None
+        )
+        if baseline_output_path and self.global_steps == 0:
+            baseline_path = os.path.abspath(
+                os.path.expanduser(str(baseline_output_path))
+            )
+            if os.path.exists(baseline_path):
+                raise ExperimentIntegrityError(
+                    f"validation baseline output already exists: {baseline_path}"
+                )
+            os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+            metric_prefix = "grpo/val/smoke20/" if smoke else "grpo/val/validation/"
+            baseline_metrics = {
+                f"{metric_prefix}{key}": float(value)
+                for key, value in summary.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+            baseline_payload = {
+                "schema_version": "travelgym-grpo-validation-baseline-v1",
+                "step": 0,
+                "source": "native_validation",
+                "protocol": protocol,
+                "step0_metrics": baseline_metrics,
+            }
+            temporary_path = f"{baseline_path}.tmp"
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(baseline_payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(temporary_path, baseline_path)
+            print(f"Wrote immutable step-0 validation baseline to {baseline_path}")
+        print(f"Dumped validation pass generations to {generations_path}")
+        print(f"Dumped validation pass summary to {summary_path}")
+
+    def _validate_task_passes(self, *, pass_k: int, smoke: bool = False):
+        """Run native validation as task-level pass@k with optional early stop."""
+        try:
+            pass_k = int(pass_k)
+        except (TypeError, ValueError) as exc:
+            raise ExperimentIntegrityError(
+                f"trainer.validation_pass_k must be a positive integer, got {pass_k!r}"
+            ) from exc
+        if pass_k < 1:
+            raise ExperimentIntegrityError(
+                f"trainer.validation_pass_k must be a positive integer, got {pass_k!r}"
+            )
+        retry_attempts = int(self.config.trainer.get("validation_retry_attempts", 0))
+        if retry_attempts:
+            raise ExperimentIntegrityError(
+                "task-level pass@k validation requires "
+                "trainer.validation_retry_attempts=0; each attempt is a fresh rollout"
+            )
+        early_stop = bool(
+            self.config.trainer.get("validation_task_level_early_stop", True)
+        )
+        dataloader = self.smoke_val_dataloader if smoke else self.val_dataloader
+        if dataloader is None:
+            dataloader = self.val_dataloader
+        expected_tasks = len(getattr(dataloader, "dataset", []))
+        attempts_by_task: dict[str, list[dict[str, Any]]] = {}
+        seen_task_keys: set[str] = set()
+        all_inputs: list[str] = []
+        all_outputs: list[str] = []
+        all_scores: list[float] = []
+        all_records: list[dict[str, Any]] = []
+
+        for test_data in dataloader:
+            original_batch = DataProto.from_single_dict(test_data)
+            task_keys = self._validation_task_keys(original_batch)
+            duplicate_keys = seen_task_keys.intersection(task_keys)
+            if duplicate_keys:
+                raise ExperimentIntegrityError(
+                    "validation dataloader yielded a task more than once: "
+                    f"{sorted(duplicate_keys)[:3]}"
+                )
+            seen_task_keys.update(task_keys)
+            pending_indices = list(range(len(original_batch)))
+
+            for attempt_number in range(1, pass_k + 1):
+                if not pending_indices:
+                    break
+                attempt_batch = original_batch.select_idxs(pending_indices)
+                attempt_keys = [task_keys[index] for index in pending_indices]
+                input_texts, test_gen_batch = self._prepare_validation_generation(
+                    attempt_batch
+                )
+                generated = self._generate_validation_batch_once(test_gen_batch)
+                output_ids = generated.batch["responses"]
+                output_texts = [
+                    self.tokenizer.decode(ids, skip_special_tokens=True)
+                    for ids in output_ids
+                ]
+                evaluated_batch = attempt_batch.union(generated)
+                result = self.val_reward_fn(evaluated_batch, return_dict=True)
+                reward_tensor = result["reward_tensor"]
+                if int(reward_tensor.shape[0]) != len(pending_indices):
+                    raise ExperimentIntegrityError(
+                        "validation reward row count is misaligned: "
+                        f"tasks={len(pending_indices)}, rewards={reward_tensor.shape[0]}"
+                    )
+                scores = reward_tensor.sum(-1).detach().cpu().tolist()
+                extra_info = result.get("reward_extra_info", {})
+                if not isinstance(extra_info, Mapping):
+                    raise ExperimentIntegrityError(
+                        "native pass@k validation requires row-aligned reward_extra_info"
+                    )
+                extra: dict[str, list] = {}
+                for key, values in extra_info.items():
+                    if hasattr(values, "tolist"):
+                        values = values.tolist()
+                    if not isinstance(values, (list, tuple)) or len(values) != len(pending_indices):
+                        raise ExperimentIntegrityError(
+                            "validation reward metadata is not row-aligned: "
+                            f"{key} has {len(values) if hasattr(values, '__len__') else 'unknown'} rows, "
+                            f"expected {len(pending_indices)}"
+                        )
+                    extra[str(key)] = list(values)
+                missing = {
+                    "completion_success",
+                    "reward_valid",
+                }.difference(extra)
+                if missing:
+                    raise ExperimentIntegrityError(
+                        "native pass@k validation is missing public reward fields: "
+                        f"{sorted(missing)}"
+                    )
+                if "terminal_reward" not in extra:
+                    extra["terminal_reward"] = list(scores)
+
+                for local_index, (global_index, task_key) in enumerate(
+                    zip(pending_indices, attempt_keys)
+                ):
+                    record: dict[str, Any] = {
+                        "task_id": task_key,
+                        "attempt": int(attempt_number),
+                        "input": input_texts[local_index],
+                        "output": output_texts[local_index],
+                        "score": float(scores[local_index]),
+                    }
+                    for metric in PUBLIC_VALIDATION_METRICS:
+                        if metric in extra:
+                            record[metric] = self._public_validation_scalar(
+                                extra[metric][local_index]
+                            )
+                    for metric in ("reward_valid", "reward_version"):
+                        if metric in extra:
+                            record[metric] = self._public_validation_scalar(
+                                extra[metric][local_index]
+                            )
+                    attempts_by_task.setdefault(task_key, []).append(record)
+                    all_records.append(record)
+                    all_inputs.append(record["input"])
+                    all_outputs.append(record["output"])
+                    all_scores.append(record["score"])
+
+                if early_stop:
+                    pending_indices = [
+                        global_index
+                        for local_index, global_index in enumerate(pending_indices)
+                        if self._validation_number(
+                            extra["completion_success"][local_index]
+                        )
+                        != 1.0
+                    ]
+                elif attempt_number < pass_k:
+                    pending_indices = list(range(len(original_batch)))
+                else:
+                    pending_indices = []
+
+                completed_tasks = sum(
+                    any(
+                        self._validation_number(row.get("completion_success"))
+                        == 1.0
+                        for row in rows
+                    )
+                    for rows in attempts_by_task.values()
+                )
+                print(
+                    "[validation-pass] "
+                    f"attempt={attempt_number}/{pass_k} "
+                    f"completed_tasks={completed_tasks}/{expected_tasks or len(seen_task_keys)} "
+                    f"pending_in_batch={len(pending_indices)}"
+                )
+
+        if expected_tasks and len(attempts_by_task) != expected_tasks:
+            raise ExperimentIntegrityError(
+                "validation task count changed during pass@k evaluation: "
+                f"expected={expected_tasks}, observed={len(attempts_by_task)}"
+            )
+        if not attempts_by_task:
+            raise ExperimentIntegrityError("native validation produced no task attempts")
+
+        summary = aggregate_validation_attempts(
+            attempts_by_task,
+            pass_k=pass_k,
+        )
+        # Keep a compact, stable view alongside the richer mean@N/mean_best
+        # validation table so SwanLab can plot the final reward and every
+        # public terminal-reward component directly.
+        component_infos = {
+            "reward": [record["score"] for record in all_records],
+        }
+        for metric in PUBLIC_VALIDATION_METRICS:
+            component_infos[metric] = [record.get(metric, 0.0) for record in all_records]
+        summary.update(compute_reward_component_metrics(component_infos))
+        if self.global_steps == 0 and bool(
+            self.config.trainer.get("initial_rollout_health_gate", False)
+        ):
+            validate_initial_rollout_health(
+                all_outputs,
+                response_token_limit=int(self.config.data.max_response_length),
+            )
+        self._maybe_log_val_generations(
+            inputs=all_inputs,
+            outputs=all_outputs,
+            scores=all_scores,
+        )
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_validation_passes(
+                all_records,
+                summary,
+                str(val_data_dir),
+                pass_k=pass_k,
+                smoke=smoke,
+                early_stop=early_stop,
+            )
+
+        prefix = "smoke20/" if smoke else "validation/"
+        return {f"{prefix}{key}": value for key, value in summary.items()}
+
     def _validate(self, *, save_best: bool = True):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -866,6 +1688,11 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        validation_retry_stats = {
+            "retried_rows": 0,
+            "recovered_rows": 0,
+            "final_invalid_rows": 0,
+        }
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -909,17 +1736,11 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                self.async_rollout_manager.wake_up()
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.sleep()
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch, retry_stats = (
+                self._generate_validation_batch_with_retries(test_gen_batch)
+            )
+            for key, value in retry_stats.items():
+                validation_retry_stats[key] += value
             print("validation generation end")
 
             # Store generated outputs
@@ -958,6 +1779,14 @@ class RayPPOTrainer:
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
+        if self.global_steps == 0 and bool(
+            self.config.trainer.get("initial_rollout_health_gate", False)
+        ):
+            validate_initial_rollout_health(
+                sample_outputs,
+                response_token_limit=int(self.config.data.max_response_length),
+            )
+
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
@@ -973,6 +1802,9 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+        for key, value in validation_retry_stats.items():
+            metric_dict[f"val-aux/runtime/{key}"] = value
+        metric_dict.update(compute_reward_component_metrics(reward_extra_infos_dict))
         
         # get all the metrics start with "val-core"
         core_metrics = [metric_dict[pfx] for pfx in metric_dict.keys() if pfx.startswith("val-core")]
@@ -1306,7 +2138,9 @@ class RayPPOTrainer:
         # it can retry complete rollout batches without changing environment
         # state or exposing private reward fields to the policy.
         dynamic_sampling_config = self.config.algorithm.get("dynamic_sampling", {})
-        if bool(dynamic_sampling_config.get("enable", False)):
+        if bool(dynamic_sampling_config.get("enable", False)) and not bool(
+            self.config.trainer.get("val_only", False)
+        ):
             from verl.trainer.ppo.dynamic_sampling import install_verl_bounded_sampler
 
             group_size = int(self.config.actor_rollout_ref.rollout.n)
@@ -1325,22 +2159,81 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # A validation-only job is an explicit native-evaluation mode.  It
+        # must run before baseline reuse and before any PPO horizon checks, so
+        # it cannot accidentally start training or silently skip live eval.
+        if bool(self.config.trainer.get("val_only", False)):
+            if self.val_reward_fn is None:
+                raise ExperimentIntegrityError(
+                    "trainer.val_only requires a validation reward function"
+                )
+            pass_k = int(self.config.trainer.get("validation_pass_k", 1))
+            val_metrics = self._validate_task_passes(
+                pass_k=pass_k,
+                smoke=bool(self.config.trainer.get("initial_validation_smoke", False)),
+            )
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Validation-only metrics: {val_metrics}")
+            logger.log(
+                data=self._stable_grpo_namespace(val_metrics, validation=True),
+                step=self.global_steps,
+            )
+            return
+
+        # Reuse the completed merged-SFT evaluation as the step-0 Validation
+        # record for formal GRPO; this avoids a second rollout.
+        baseline_path = self.config.trainer.get("initial_validation_baseline_path", None)
+        validation_disabled = bool(self.config.trainer.get("disable_validation", False))
+        val_before_train = bool(self.config.trainer.get("val_before_train", True))
+        if (
+            not validation_disabled
+            and baseline_path
+            and not val_before_train
+            and self.global_steps == 0
+        ):
+            try:
+                baseline_metrics = load_step0_validation_metrics(baseline_path)
+            except (FileNotFoundError, ValidationBaselineError, OSError) as exc:
+                resolved = resolve_validation_baseline_path(baseline_path)
+                raise ExperimentIntegrityError(
+                    f"configured step-0 validation baseline is unusable: {resolved}"
+                ) from exc
+            pprint(
+                "Initial validation baseline reused: "
+                f"{resolve_validation_baseline_path(baseline_path)}"
+            )
+            logger.log(data=baseline_metrics, step=self.global_steps)
+
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+        elif (
+            not validation_disabled
+            and self.val_reward_fn is not None
+            and self.config.trainer.get("val_before_train", True)
+        ):
+            # TravelGym's formal run uses the fixed 20-task smoke view at
+            # both boundaries.  Keep the generic trainer's full-validation
+            # default unless the experiment opts into this diagnostic view.
+            validation_pass_k = int(self.config.trainer.get("validation_pass_k", 1))
+            if validation_pass_k > 1:
+                val_metrics = self._validate_task_passes(
+                    pass_k=validation_pass_k,
+                    smoke=bool(self.config.trainer.get("initial_validation_smoke", False)),
+                )
+            elif bool(self.config.trainer.get("initial_validation_smoke", False)):
+                val_metrics = self._validate_smoke()
+            else:
+                val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=self._stable_grpo_namespace(val_metrics, validation=True), step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
 
-        # ``total_training_steps`` is fixed at 200 for optimizer/scheduler;
-        # this process may stop at a smaller run_until_step and be resumed.
+        # Reuse the profile policy resolved during trainer initialization.
         run_until_step = validate_process_run_until_step(
             self.config.trainer.get("run_until_step", None),
             total_training_steps=self.total_training_steps,
-            allowed_steps=(5, 50, 200),
+            allowed_steps=self.allowed_run_until_steps,
         )
         if self.global_steps >= run_until_step:
             print(f"run_until_step={run_until_step} already reached; no rollout started")
@@ -1448,7 +2341,17 @@ class RayPPOTrainer:
                                 "training/dynamic_sampling_batches": int(dynamic_info.get("sampled_batches", 0)),
                                 "training/dynamic_sampling_accepted_groups": int(dynamic_info.get("accepted_groups", 0)),
                                 "training/dynamic_sampling_constant_groups": int(dynamic_info.get("constant_reward_group_count", 0)),
+                                "training/dynamic_sampling_insufficient_spread_groups": int(
+                                    dynamic_info.get("insufficient_reward_spread_group_count", 0)
+                                ),
                                 "training/dynamic_sampling_invalid_groups": int(dynamic_info.get("invalid_group_count", 0)),
+                            })
+                        rollout_length_info = gen_batch_output.meta_info.get("travel_rollout_length")
+                        if isinstance(rollout_length_info, Mapping):
+                            metrics.update({
+                                f"training/rollout_length_{key}": float(value)
+                                for key, value in rollout_length_info.items()
+                                if isinstance(value, (int, float))
                             })
                         if gen_batch_output.meta_info.get("travel_skip_update", False):
                             metrics["training/dynamic_sampling_skipped_update"] = 1.0
@@ -1583,7 +2486,18 @@ class RayPPOTrainer:
 
                         # print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.non_tensor_batch.update(
+                                _aligned_reward_extra_info_arrays(
+                                    reward_extra_infos_dict,
+                                    batch_size=len(batch),
+                                )
+                            )
+                        metrics.update(
+                            compute_reward_component_metrics(
+                                reward_extra_infos_dict,
+                                prefix="training/reward",
+                            )
+                        )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1613,10 +2527,20 @@ class RayPPOTrainer:
                             metrics.update({
                                 "training/terminal_sampling_trainable_groups": sampling_stats.get("trainable_group_count", 0),
                                 "training/terminal_sampling_skipped_groups": sampling_stats.get("skipped_group_count", 0),
+                                "training/terminal_sampling_constant_groups": sampling_stats.get(
+                                    "skip_reason_counts", {}
+                                ).get("constant_reward", 0),
+                                "training/terminal_sampling_insufficient_spread_groups": sampling_stats.get(
+                                    "skip_reason_counts", {}
+                                ).get("insufficient_reward_spread", 0),
                                 "training/terminal_sampling_kept_rows": sampling_stats.get("kept_rows", 0),
                             })
                         if "turn_credit_conservation_error" in batch.meta_info:
                             metrics["training/turn_credit_conservation_error"] = batch.meta_info["turn_credit_conservation_error"]
+                        turn_credit_diagnostics = batch.meta_info.get("turn_credit_diagnostics", {})
+                        for name, value in turn_credit_diagnostics.items():
+                            if isinstance(value, (int, float)):
+                                metrics[f"training/turn_credit_{name}"] = float(value)
                             
                     # update critic
                     if self.use_critic:
@@ -1662,9 +2586,26 @@ class RayPPOTrainer:
                     if is_milestone or is_periodic_save or is_last_step:
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint(valid_save_best=False)
-                        if self.val_reward_fn is not None and (is_milestone or is_last_step):
+                        if (
+                            not bool(self.config.trainer.get("disable_validation", False))
+                            and self.val_reward_fn is not None
+                            and (is_milestone or is_last_step)
+                        ):
                             with _timer("testing", timing_raw):
-                                val_metrics: dict = self._validate_smoke() if is_milestone else self._validate()
+                                validation_pass_k = int(
+                                    self.config.trainer.get("validation_pass_k", 1)
+                                )
+                                if validation_pass_k > 1:
+                                    val_metrics: dict = self._validate_task_passes(
+                                        pass_k=validation_pass_k,
+                                        smoke=bool(is_milestone),
+                                    )
+                                else:
+                                    val_metrics = (
+                                        self._validate_smoke()
+                                        if is_milestone
+                                        else self._validate()
+                                    )
                                 if is_last_step:
                                     last_val_metrics = val_metrics
                             metrics.update(val_metrics)
@@ -1691,7 +2632,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    if self.global_steps >= 200 and bool(self.config.trainer.get("wait_for_selected_grpo_checkpoint", True)):
+                    if self.training_profile == "production" and self.run_until_step >= self.total_training_steps and bool(self.config.trainer.get("wait_for_selected_grpo_checkpoint", True)):
                         marker = os.path.join(self.config.trainer.default_local_dir, "WAITING_FOR_SELECTED_GRPO_CHECKPOINT")
                         with open(marker, "w", encoding="utf-8") as handle:
                             handle.write("Provide SELECTED_GRPO_CHECKPOINT manually before launching final200.\n")

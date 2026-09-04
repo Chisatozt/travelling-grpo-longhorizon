@@ -108,12 +108,18 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        missing_transformer_cls_names = []
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
+                missing_transformer_cls_names.append(layer_class)
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
+        if not transformer_cls_to_wrap:
+            raise Exception(
+                "Could not find any transformer layer class to wrap in the model; "
+                f"requested={list(fsdp_transformer_layer_cls_to_wrap)!r}"
+            )
 
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy,
@@ -432,6 +438,11 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
         fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
+    elif fsdp_transformer_layer_cls_to_wrap is not None:
+        # Transformers 5 exposes ``_no_split_modules`` as a set for some
+        # architectures (including Qwen3.5); FSDP2 only needs an iterable,
+        # but the validation below also indexes the first element.
+        fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
 
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 

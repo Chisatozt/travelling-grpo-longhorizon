@@ -21,7 +21,11 @@ import os
 import torch
 import torch.distributed as dist
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+try:
+    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+except ImportError:
+    # SGLang >= 0.5 moved this helper into the weight-updater component.
+    from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
 from sglang.srt.utils import MultiprocessingSerializer
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -33,7 +37,7 @@ from verl.protocol import all_gather_data_proto
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
 from verl.utils.debug.performance import _timer
 from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
-from verl.utils.model import convert_weight_keys
+from verl.utils.model import convert_weight_keys, merge_peft_state_dict_for_inference
 from verl.utils.torch_functional import check_device_is_available
 
 from .base import BaseShardingManager
@@ -47,6 +51,17 @@ def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
     if isinstance(tensor, DTensor):
         return tensor.full_tensor()
     return tensor
+
+
+def _collect_lora_scalings(peft_model, adapter_name: str = "default") -> dict[str, float]:
+    """Collect PEFT's effective per-module scaling, including rank patterns."""
+    scalings = {}
+    for name, submodule in peft_model.named_modules():
+        module_scaling = getattr(submodule, "scaling", None)
+        if isinstance(module_scaling, dict) and adapter_name in module_scaling:
+            normalized_name = name.replace("_fsdp_wrapped_module.", "")
+            scalings[normalized_name] = float(module_scaling[adapter_name])
+    return scalings
 
 
 class FSDPSGLangShardingManager(BaseShardingManager):
@@ -103,7 +118,7 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
             device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
             params = {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
-            params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+            params = self._prepare_inference_weights(params)
             # Copy, not share memory
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self.update_weights(params))
@@ -119,6 +134,31 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             if self.device_mesh is not None:
                 self.torch_random_states = torch.cuda.get_rng_state()
                 torch.cuda.set_rng_state(self.gen_random_states)
+
+    def _prepare_inference_weights(self, params):
+        wrapped_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        if hasattr(wrapped_model, "peft_config"):
+            params = merge_peft_state_dict_for_inference(
+                params,
+                lora_scalings=_collect_lora_scalings(wrapped_model),
+            )
+        params = convert_weight_keys(params, wrapped_model)
+        if not params:
+            raise RuntimeError("Refusing to update SGLang with an empty state dict")
+        invalid_keys = [
+            key
+            for key in params
+            if key.startswith("base_model.")
+            or ".base_layer." in key
+            or ".lora_A." in key
+            or ".lora_B." in key
+        ]
+        if invalid_keys:
+            raise RuntimeError(
+                "SGLang weight sync still contains PEFT-only names: "
+                + ", ".join(invalid_keys[:3])
+            )
+        return params
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
@@ -162,17 +202,37 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             del serialized_tensor
             torch.cuda.empty_cache()
 
+            update_error = None
             if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                await self.inference_engine.update_weights_from_tensor(
-                    named_tensors=[
-                        (
-                            name,
-                            LocalSerializedTensor(values=gathered_serialized_tensors),
-                        )
-                    ],
-                    load_format=load_format,
-                    flush_cache=tensor_index == len(named_tensors) - 1,
-                )
+                try:
+                    result = await self.inference_engine.update_weights_from_tensor(
+                        named_tensors=[
+                            (
+                                name,
+                                LocalSerializedTensor(values=gathered_serialized_tensors),
+                            )
+                        ],
+                        load_format=load_format,
+                        flush_cache=tensor_index == len(named_tensors) - 1,
+                    )
+                    if isinstance(result, tuple):
+                        success, message = result
+                    else:
+                        success = bool(getattr(result, "success", result))
+                        message = str(getattr(result, "message", ""))
+                    if not success:
+                        update_error = f"{name}: {message or 'unknown SGLang error'}"
+                except Exception as exc:
+                    update_error = f"{name}: {type(exc).__name__}: {exc}"
+
+            error_payload = [update_error]
+            dist.broadcast_object_list(
+                error_payload,
+                src=self.device_mesh["infer_tp"].mesh.tolist()[0],
+                group=self.device_mesh["infer_tp"].get_group(),
+            )
+            if error_payload[0] is not None:
+                raise RuntimeError(f"SGLang rejected an actor weight update: {error_payload[0]}")
 
     async def release_memory(self):
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
@@ -188,6 +248,7 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
         device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
         params = {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
+        params = self._prepare_inference_weights(params)
         # Copy, not share memory
         await self.update_weights(params)
         log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)

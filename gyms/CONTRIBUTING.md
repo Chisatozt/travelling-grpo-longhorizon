@@ -10,7 +10,7 @@ All environment changes in this repository target `gyms/TravelGym`.
 3. Answer submits exactly one ID visible in the current Search result.
 4. Public observations contain only the six control fields and public
    conversation history described in `docs/travel_public_protocol.md`.
-5. Reward remains terminal-only (`travelgym-terminal-v1`); diagnostics stay out
+5. Reward remains terminal-only (`travelgym-terminal-v2`); diagnostics stay out
    of Actor observations and tool feedback.
 
 ## Validation

@@ -85,7 +85,10 @@ def _as_bool(value) -> bool:
 def _infer_travel_variant(path: str | os.PathLike[str]) -> str | None:
     """Infer the authoritative TravelGym composition from a parquet path."""
 
-    parent_name = os.path.basename(os.path.dirname(os.fspath(path)))
+    # Manifests may be audited on Windows and consumed on Linux; normalize
+    # both path separator styles before deriving the variant directory.
+    normalized_path = os.fspath(path).replace("\\", "/")
+    parent_name = os.path.basename(os.path.dirname(normalized_path))
     match = _TRAVEL_VARIANT_RE.fullmatch(parent_name)
     return match.group(1).casefold() if match else None
 

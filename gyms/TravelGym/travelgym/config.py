@@ -40,6 +40,12 @@ class TravelGymConfig:
         default_factory=lambda: int(os.getenv("MAX_OUTPUT_TOKENS", 2048))
     )
     timeout: float = 15.0
+    # ``deepseek_api`` restores the question-aware User Simulator used while
+    # collecting Teacher SFT trajectories.  ``local`` remains available only
+    # for explicitly offline tests and diagnostics.
+    user_simulator_mode: str = field(
+        default_factory=lambda: os.getenv("TRAVELGYM_USER_SIMULATOR", "local")
+    )
     
     # Environment configuration
     # The public training/evaluation contract uses one long-horizon budget.
@@ -50,7 +56,7 @@ class TravelGymConfig:
     # Reward configuration.  TravelGym now scores only once, at episode end.
     # The legacy fields remain in the dataclass for checkpoint/config
     # compatibility, but the environment deliberately ignores them.
-    reward_version: str = "travelgym-terminal-v1"
+    reward_version: str = "travelgym-terminal-v2"
     reward_scale: float = 1.0
     step_penalty: float = 0.0
     search_correct_reward: float = 0.0
@@ -128,10 +134,23 @@ class TravelGymConfig:
         if self.timeout <= 0:
             raise ValueError("timeout must be positive")
 
-        if self.reward_version != "travelgym-terminal-v1":
+        if self.user_simulator_mode not in {"local", "deepseek_api"}:
+            raise ValueError(
+                "user_simulator_mode must be 'local' or 'deepseek_api'"
+            )
+
+        if self.user_simulator_mode == "deepseek_api":
+            if not self.api_key:
+                raise ValueError("DeepSeek User Simulator requires an API key")
+            if "deepseek" not in self.model_name.casefold():
+                raise ValueError(
+                    "DeepSeek User Simulator requires USER_MODEL_NAME to name a DeepSeek model"
+                )
+
+        if self.reward_version != "travelgym-terminal-v2":
             raise ValueError(
                 "TravelGym only supports terminal reward version "
-                "'travelgym-terminal-v1'"
+                "'travelgym-terminal-v2'"
             )
     
     def to_dict(self) -> Dict[str, Any]:

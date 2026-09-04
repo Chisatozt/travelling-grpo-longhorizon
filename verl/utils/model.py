@@ -18,6 +18,8 @@ Utilities to create common models from huggingface
 import os
 import re
 import warnings
+from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Dict, Optional, Type
 
 import numpy as np
@@ -227,6 +229,98 @@ def convert_weight_keys(state_dict: Dict[str, torch.Tensor], model: PreTrainedMo
         original_weights[key] = value
 
     return original_weights
+
+
+_LORA_A_WEIGHT_RE = re.compile(r"^(?P<stem>.+)\.lora_A\.(?P<adapter>[^.]+)\.weight$")
+
+
+def _strip_fsdp_wrapper_from_key(key: str) -> str:
+    """Remove FSDP implementation details without changing the HF model path."""
+    return key.replace("_fsdp_wrapped_module.", "")
+
+
+def _peft_key_to_hf_key(key: str) -> str:
+    """Convert a PEFT-wrapped state-dict key to the underlying HF key."""
+    key = _strip_fsdp_wrapper_from_key(key)
+    if key.startswith("base_model.model."):
+        key = key[len("base_model.model.") :]
+    return key.replace(".base_layer.", ".")
+
+
+def merge_peft_state_dict_for_inference(
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    lora_scalings: Mapping[str, float],
+    adapter_name: str = "default",
+) -> OrderedDict[str, torch.Tensor]:
+    """Return standard HF weights with the selected LoRA adapter merged.
+
+    SGLang's ordinary HF loader does not understand PEFT wrapper names such as
+    base_model.model.*.base_layer or lora_A.default. Passing those names can
+    report success while loading no useful tensors. This function materializes
+    DTensors when needed, merges B @ A into each base linear weight, and emits
+    only names understood by the underlying HF model.
+    """
+
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+    normalized = OrderedDict(
+        (_strip_fsdp_wrapper_from_key(key), value) for key, value in state_dict.items()
+    )
+    merged = OrderedDict()
+
+    for key, value in normalized.items():
+        if ".lora_" in key:
+            continue
+        hf_key = _peft_key_to_hf_key(key)
+        if hf_key in merged:
+            raise ValueError(f"Duplicate HF weight after PEFT key normalization: {hf_key}")
+        merged[hf_key] = materialize(value)
+
+    matched_lora_weights = 0
+    for a_key, a_value in normalized.items():
+        match = _LORA_A_WEIGHT_RE.match(a_key)
+        if match is None or match.group("adapter") != adapter_name:
+            continue
+
+        stem = match.group("stem")
+        b_key = f"{stem}.lora_B.{adapter_name}.weight"
+        if b_key not in normalized:
+            raise ValueError(f"Missing LoRA B weight paired with {a_key}")
+
+        base_key = f"{stem}.base_layer.weight"
+        if base_key not in normalized:
+            base_key = f"{stem}.weight"
+        if base_key not in normalized:
+            raise ValueError(f"Missing base weight paired with {a_key}")
+
+        scaling_key = _strip_fsdp_wrapper_from_key(stem)
+        if scaling_key not in lora_scalings:
+            raise ValueError(f"Missing LoRA scaling for module {scaling_key}")
+
+        base = materialize(normalized[base_key])
+        lora_a = materialize(a_value)
+        lora_b = materialize(normalized[b_key])
+        delta = torch.matmul(lora_b.to(torch.float32), lora_a.to(torch.float32))
+        merged[_peft_key_to_hf_key(base_key)] = base + delta.to(base.dtype) * float(
+            lora_scalings[scaling_key]
+        )
+        matched_lora_weights += 1
+
+    if not matched_lora_weights:
+        raise ValueError(f"No LoRA weights found for adapter {adapter_name!r}")
+
+    forbidden_fragments = ("base_model.model.", ".base_layer.", ".lora_A.", ".lora_B.")
+    invalid_keys = [
+        key for key in merged if any(fragment in key for fragment in forbidden_fragments)
+    ]
+    if invalid_keys:
+        raise ValueError(
+            "PEFT-only names remain after inference-weight conversion: "
+            + ", ".join(invalid_keys[:3])
+        )
+    return merged
 
 
 def normalize_model_name(name, pp_rank, vpp_rank, transformer_config, layer_name="layers"):
@@ -502,7 +596,11 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForTokenClassification, AutoModelForCausalLM, AutoModelForVision2Seq
+    from transformers import AutoModelForTokenClassification, AutoModelForCausalLM
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(

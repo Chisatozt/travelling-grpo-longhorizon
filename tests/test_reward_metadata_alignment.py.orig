@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+from tensordict import TensorDict
+
+from verl import DataProto
+from verl.tools.travel_reward_metrics import TRAVEL_REWARD_METRIC_NAMES
+from verl.trainer.ppo.ray_trainer import _aligned_reward_extra_info_arrays
+from verl.workers.reward_manager.naive import NaiveRewardManager
+
+
+class _Tokenizer:
+    def decode(self, token_ids, skip_special_tokens=True):
+        del token_ids, skip_special_tokens
+        return ""
+
+
+def _reward_scores(*, valid: bool, api_calls: float | None = None) -> dict:
+    scores = {
+        "interact_with_env": 0.5 if valid else 0.0,
+        "interact_with_env_reward_valid": float(valid),
+        "interact_with_env_terminal_only": 1.0,
+    }
+    if api_calls is not None:
+        scores["interact_with_env_user_api_calls"] = api_calls
+    return scores
+
+
+def test_mixed_valid_and_quarantined_rows_keep_every_metric_aligned():
+    batch_size = 16
+    reward_scores = [
+        *[_reward_scores(valid=True, api_calls=2.0) for _ in range(11)],
+        *[_reward_scores(valid=False) for _ in range(4)],
+        None,
+    ]
+    data = DataProto(
+        batch=TensorDict(
+            {
+                "prompts": torch.ones((batch_size, 2), dtype=torch.long),
+                "responses": torch.ones((batch_size, 3), dtype=torch.long),
+                "attention_mask": torch.ones((batch_size, 5), dtype=torch.long),
+            },
+            batch_size=[batch_size],
+        ),
+        non_tensor_batch={
+            "reward_model": np.array(
+                [{"ground_truth": ""} for _ in range(batch_size)], dtype=object
+            ),
+            "data_source": np.array(
+                ["interact_travelgym"] * batch_size, dtype=object
+            ),
+            "reward_scores": np.array(reward_scores, dtype=object),
+            "extra_info": np.array([{} for _ in range(batch_size)], dtype=object),
+        },
+    )
+
+    result = NaiveRewardManager(_Tokenizer(), num_examine=0)(
+        data, return_dict=True
+    )
+    extra = result["reward_extra_info"]
+
+    for metric_name in TRAVEL_REWARD_METRIC_NAMES:
+        assert len(extra[metric_name]) == batch_size
+    assert extra["user_api_calls"] == [2.0] * 11 + [0.0] * 5
+    arrays = _aligned_reward_extra_info_arrays(extra, batch_size=batch_size)
+    assert all(len(value) == batch_size for value in arrays.values())
+
+
+def test_ragged_reward_metadata_fails_before_actor_update():
+    with pytest.raises(ValueError, match="user_api_calls=11"):
+        _aligned_reward_extra_info_arrays(
+            {
+                "score": [0.0] * 16,
+                "user_api_calls": [0.0] * 11,
+            },
+            batch_size=16,
+        )

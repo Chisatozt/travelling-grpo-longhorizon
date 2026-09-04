@@ -23,6 +23,7 @@ import time
 from contextlib import contextmanager
 from copy import deepcopy
 from json import JSONDecodeError
+from importlib.metadata import PackageNotFoundError, version
 from typing import List, Optional, Tuple
 from uuid import uuid4
 
@@ -31,38 +32,73 @@ import sglang.srt.entrypoints.engine
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
-from sglang.srt.managers.tokenizer_manager import (
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
-from sglang.srt.openai_api.protocol import Tool
+try:
+    from sglang.srt.managers.tokenizer_manager import (
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightsFromTensorReqInput,
+    )
+except ImportError:
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightsFromTensorReqInput,
+    )
+try:
+    from sglang.srt.openai_api.protocol import Tool
+except ImportError:
+    from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    assert_pkg_version,
-    get_ip,
-    get_open_port,
-    is_cuda,
-    maybe_set_triton_cache_manager,
-    set_prometheus_multiproc_dir,
-    set_ulimit,
-)
+try:
+    from sglang.srt.utils import (
+        MultiprocessingSerializer,
+        assert_pkg_version,
+        get_ip,
+        get_open_port,
+        is_cuda,
+        maybe_set_triton_cache_manager,
+        set_prometheus_multiproc_dir,
+        set_ulimit,
+    )
+except ImportError:
+    import socket
+
+    from sglang.srt.utils.common import (
+        MultiprocessingSerializer,
+        assert_pkg_version,
+        is_cuda,
+        set_prometheus_multiproc_dir,
+        set_ulimit,
+    )
+    from sglang.srt.utils.network import get_open_port
+
+    def get_ip():
+        return socket.gethostbyname(socket.gethostname())
+
+    def maybe_set_triton_cache_manager():
+        return None
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizer
 
 from verl import DataProto
+from verl.protocol import make_1d_object_array
 from verl.third_party.sglang import parallel_state as sglang_ps
 from verl.tools.base_tool import BaseTool
+from verl.tools.travel_reward_metrics import (
+    TRAVEL_QUALITY_METRIC_NAMES,
+    TRAVEL_REWARD_METRIC_NAMES,
+    TRAVEL_USER_METRIC_NAMES,
+)
 from verl.tools.schemas import (
     OpenAIFunctionCallSchema,
     OpenAIFunctionParsedSchema,
     OpenAIFunctionToolCall,
 )
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.net_utils import is_ipv6
 from verl.utils.torch_functional import (
     get_response_mask,
@@ -74,6 +110,10 @@ from verl.workers.rollout.schemas import (
     AsyncRolloutRequestStateEnum,
     FinishReasonTypeEnum,
     Message,
+    RolloutLengthExceededError,
+    RolloutProtocolError,
+    RolloutTemplateAlignmentError,
+    compute_generation_budget,
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
@@ -117,10 +157,18 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please uninstall the old version and reinstall the latest version by following the instructions at https://docs.flashinfer.ai/installation.html.",
         )
     if is_cuda():
+        try:
+            version("sglang-kernel")
+            kernel_package = "sglang-kernel"
+            minimum_kernel_version = "0.4.6"
+        except PackageNotFoundError:
+            # SGLang <= 0.4 published the CUDA extension as ``sgl-kernel``.
+            kernel_package = "sgl-kernel"
+            minimum_kernel_version = "0.1.1"
         assert_pkg_version(
-            "sgl-kernel",
-            "0.1.1",
-            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            kernel_package,
+            minimum_kernel_version,
+            f"Please reinstall it with `pip install {kernel_package} --force-reinstall`",
         )
 
     # Set mp start method
@@ -232,12 +280,18 @@ def get_tool_call_parser_type(tokenizer: PreTrainedTokenizer, config=None) -> st
             )
         parser = parser_cls()
         vocab = tokenizer.get_vocab()
-        if parser.bot_token.strip() not in vocab or (parser.eot_token and parser.eot_token.strip() not in vocab):
+        # Newer structural-tag parsers expose start/end fields instead of
+        # bot_token/eot_token; accept either representation.
+        bot_token = (getattr(parser, "bot_token", "") or getattr(parser, "tool_call_start_token", "")).strip()
+        eot_token = (getattr(parser, "eot_token", "") or getattr(parser, "tool_call_end_token", "")).strip()
+        if not bot_token or bot_token not in vocab or (eot_token and eot_token not in vocab):
             raise ValueError(f"Configured parser {requested!r} is incompatible with the tokenizer")
         return requested
     for parser_type, parser_cls in items:
         parser = parser_cls()
-        if parser.bot_token.strip() in tokenizer.get_vocab() and (parser.eot_token == "" or parser.eot_token.strip() in tokenizer.get_vocab()):
+        bot_token = (getattr(parser, "bot_token", "") or getattr(parser, "tool_call_start_token", "")).strip()
+        eot_token = (getattr(parser, "eot_token", "") or getattr(parser, "tool_call_end_token", "")).strip()
+        if bot_token in tokenizer.get_vocab() and (not eot_token or eot_token in tokenizer.get_vocab()):
             return parser_type
     else:
         raise ValueError(f"No tool call parser found for tokenizer {tokenizer}")
@@ -279,6 +333,40 @@ class SGLangRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        multi_turn_config = config.get("multi_turn", {})
+        self._max_new_tokens_per_turn = int(
+            multi_turn_config.get("max_new_tokens_per_turn", 2048)
+        )
+        self._max_reasoning_tokens_per_turn = int(
+            multi_turn_config.get("max_reasoning_tokens_per_turn", 2560)
+        )
+        self._max_tool_call_tokens_per_turn = int(
+            multi_turn_config.get("max_tool_call_tokens_per_turn", 512)
+        )
+        self._tool_response_token_reserve = int(
+            multi_turn_config.get("tool_response_token_reserve", 6144)
+        )
+        self._template_token_reserve = int(
+            multi_turn_config.get("template_token_reserve", 32)
+        )
+        if (
+            self._max_new_tokens_per_turn <= 0
+            or self._max_reasoning_tokens_per_turn <= 0
+            or self._max_tool_call_tokens_per_turn <= 0
+            or self._tool_response_token_reserve <= 0
+            or self._template_token_reserve <= 0
+        ):
+            raise ValueError(
+                "multi_turn token budgets must be positive: "
+                "max_new_tokens_per_turn, max_reasoning_tokens_per_turn, "
+                "max_tool_call_tokens_per_turn, tool_response_token_reserve, "
+                "template_token_reserve"
+            )
+        if self._max_reasoning_tokens_per_turn + self._max_tool_call_tokens_per_turn > self._max_new_tokens_per_turn:
+            raise ValueError(
+                "reasoning and tool-call token caps must fit within "
+                "max_new_tokens_per_turn"
+            )
         self._device_mesh_cpu = device_mesh
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
@@ -352,7 +440,12 @@ class SGLangRollout(BaseRollout):
             self.config.max_model_len = self.config.prompt_length + self.config.response_length
         assert self.config.max_model_len >= self.config.prompt_length + self.config.response_length, f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
             {self.config.max_model_len} >= {self.config.prompt_length} + {self.config.response_length}"""
-        assert model_hf_config.max_position_embeddings >= self.config.max_model_len, "model context length should be greater than total sequence length"
+        max_position_embeddings = getattr(model_hf_config, "max_position_embeddings", None)
+        if max_position_embeddings is None:
+            text_config = getattr(model_hf_config, "text_config", None)
+            max_position_embeddings = getattr(text_config, "max_position_embeddings", None)
+        assert max_position_embeddings is not None, "model config must expose max_position_embeddings"
+        assert max_position_embeddings >= self.config.max_model_len, "model context length should be greater than total sequence length"
         # currently max_turns stand for max number of tool calls
         if self.config.multi_turn.max_turns is None:
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
@@ -419,6 +512,8 @@ class SGLangRollout(BaseRollout):
             presence_penalty=0.0,
             frequency_penalty=0.0,
             repetition_penalty=1.0,
+            stop=None,
+            no_stop_trim=False,
         )
         # supporting adding any sampling params from the config file
         for k in self.config.keys():
@@ -745,10 +840,288 @@ class SGLangRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)
 
+    def _compute_generation_budget(
+        self,
+        req: AsyncRolloutRequest,
+        generation_prompt_ids: list[int],
+        *,
+        max_new_tokens_per_turn: int | None = None,
+        phase: str = "generation",
+    ) -> int:
+        current_response_tokens = max(0, len(generation_prompt_ids) - len(req.prompt_ids))
+        phase_cap = int(max_new_tokens_per_turn or self._max_new_tokens_per_turn)
+        max_new_tokens, budget_clamped = compute_generation_budget(
+            generation_prompt_tokens=len(generation_prompt_ids),
+            current_response_tokens=current_response_tokens,
+            max_model_len=req.max_model_len,
+            max_response_len=req.max_response_len,
+            max_new_tokens_per_turn=phase_cap,
+            tool_response_token_reserve=self._tool_response_token_reserve,
+            template_token_reserve=self._template_token_reserve,
+            has_tools=bool(req.tool_schemas),
+        )
+        req.record_length_event(
+            phase,
+            context_tokens=len(generation_prompt_ids),
+            response_tokens=current_response_tokens,
+            generation_prompt_tokens=len(generation_prompt_ids),
+            current_response_tokens=current_response_tokens,
+            remaining_response_tokens=max(0, req.max_response_len - current_response_tokens),
+            remaining_context_tokens=max(0, req.max_model_len - len(generation_prompt_ids)),
+            max_new_tokens=max_new_tokens,
+            budget_clamped=budget_clamped,
+        )
+        return max_new_tokens
+
+    @staticmethod
+    def _assert_request_budget(req: AsyncRolloutRequest) -> None:
+        context_tokens = len(req.input_ids)
+        response_tokens = max(0, context_tokens - len(req.prompt_ids))
+        if context_tokens > req.max_model_len or response_tokens > req.max_response_len:
+            raise RolloutLengthExceededError(
+                f"request {req.request_id} exceeded cumulative token budget: "
+                f"context={context_tokens}/{req.max_model_len}, "
+                f"response={response_tokens}/{req.max_response_len}"
+            )
+
+    @staticmethod
+    def _is_length_exception(exc: Exception) -> bool:
+        if isinstance(exc, RolloutLengthExceededError):
+            return True
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in ("max_model_len", "max_response_len", "max_prompt_len")
+        ) and ("exceed" in text or "length" in text)
+
+    async def _release_tools_for_request(self, req: AsyncRolloutRequest) -> None:
+        for name, tool_kwargs in req.tools_kwargs.items():
+            tool = self._tool_map.get(name)
+            if tool is None:
+                continue
+            try:
+                await tool.release(
+                    req.request_id,
+                    **tool_kwargs.get("release_kwargs", {}),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to release quarantined rollout tool %s for %s",
+                    name,
+                    req.request_id,
+                )
+
+    async def _quarantine_user_metrics(
+        self,
+        req: AsyncRolloutRequest,
+    ) -> dict[str, float]:
+        """Capture API usage accumulated before an invalid rollout is released."""
+        metrics = {name: 0.0 for name in TRAVEL_USER_METRIC_NAMES}
+        for name in req.tools_kwargs:
+            tool = self._tool_map.get(name)
+            getter = getattr(tool, "get_reward_metadata", None)
+            if getter is None:
+                continue
+            try:
+                metadata = await getter(req.request_id)
+            except Exception:
+                logger.exception(
+                    "Failed to capture quarantined rollout telemetry from %s for %s",
+                    name,
+                    req.request_id,
+                )
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            for metric_name in TRAVEL_USER_METRIC_NAMES:
+                try:
+                    metrics[metric_name] += float(metadata.get(metric_name, 0.0))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring non-numeric quarantined metric %s from %s for %s",
+                        metric_name,
+                        name,
+                        req.request_id,
+                    )
+        return metrics
+
+    async def _quarantine_invalid_request(
+        self,
+        req: AsyncRolloutRequest,
+        exc: Exception,
+        *,
+        phase: str,
+        finish_reason: FinishReasonTypeEnum,
+    ) -> AsyncRolloutRequest:
+        user_metrics = await self._quarantine_user_metrics(req)
+        await self._release_tools_for_request(req)
+        invalid = deepcopy(req)
+        invalid.tools_kwargs = {}
+        invalid.state = AsyncRolloutRequestStateEnum.COMPLETED
+        invalid.input_ids = list(invalid.prompt_ids)
+        invalid.attention_mask = [1] * len(invalid.input_ids)
+        invalid.position_ids = compute_position_id_with_mask(
+            torch.tensor(invalid.attention_mask)
+        ).tolist()
+        invalid.loss_mask = [0] * len(invalid.input_ids)
+        invalid.response_ids = []
+        invalid.response_attention_mask = []
+        invalid.response_position_ids = []
+        invalid.response_loss_mask = []
+        invalid.turn_boundaries = []
+        invalid.conversation_histories = []
+        invalid.metrics = {}
+        invalid.reward_scores = {
+            "interact_with_env": 0.0,
+            "interact_with_env_reward_valid": 0.0,
+            "interact_with_env_terminal_only": 1.0,
+            **{
+                f"interact_with_env_{metric_name}": 0.0
+                for metric_name in TRAVEL_QUALITY_METRIC_NAMES
+            },
+            **{
+                f"interact_with_env_{metric_name}": value
+                for metric_name, value in user_metrics.items()
+            },
+        }
+        invalid.finish_reason = finish_reason.value
+        invalid.length_events = []
+        invalid.record_length_event(
+            phase,
+            budget_clamped=finish_reason == FinishReasonTypeEnum.LENGTH,
+            invalid=True,
+        )
+        logger.warning(
+            "Quarantined invalid rollout request %s during %s: %s",
+            req.request_id,
+            phase,
+            exc,
+        )
+        return invalid
+
+    async def _quarantine_length_exceeded(
+        self,
+        req: AsyncRolloutRequest,
+        exc: Exception,
+    ) -> AsyncRolloutRequest:
+        return await self._quarantine_invalid_request(
+            req,
+            exc,
+            phase="length",
+            finish_reason=FinishReasonTypeEnum.LENGTH,
+        )
+
+    async def _quarantine_template_alignment(
+        self,
+        req: AsyncRolloutRequest,
+        exc: Exception,
+    ) -> AsyncRolloutRequest:
+        return await self._quarantine_invalid_request(
+            req,
+            exc,
+            phase="template_alignment",
+            finish_reason=FinishReasonTypeEnum.STOP,
+        )
+
+    async def _quarantine_tool_protocol(
+        self,
+        req: AsyncRolloutRequest,
+        exc: Exception,
+    ) -> AsyncRolloutRequest:
+        return await self._quarantine_invalid_request(
+            req,
+            exc,
+            phase="tool_protocol",
+            finish_reason=FinishReasonTypeEnum.STOP,
+        )
+
+    def _validate_tool_calls(self, req: AsyncRolloutRequest, tool_calls) -> None:
+        unknown_names = sorted(
+            {
+                str(tool_call.function.name)
+                for tool_call in tool_calls
+                if tool_call.function.name not in self._tool_map
+                or tool_call.function.name not in req.tools_kwargs
+            }
+        )
+        if unknown_names:
+            available_names = sorted(set(self._tool_map) & set(req.tools_kwargs))
+            raise RolloutProtocolError(
+                f"request {req.request_id} generated unknown tool name(s) "
+                f"{unknown_names}; available tools are {available_names}"
+            )
+
+    def _parse_tool_call_output(
+        self,
+        req: AsyncRolloutRequest,
+        content: str,
+    ) -> list[OpenAIFunctionToolCall]:
+        if not self._function_call_parser or not self._function_call_parser.has_tool_call(content):
+            raise RolloutProtocolError(
+                f"request {req.request_id} did not emit a tool call after </think>"
+            )
+        try:
+            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
+        except (JSONDecodeError, AttributeError) as exc:
+            raise RolloutProtocolError(
+                f"request {req.request_id} emitted an invalid tool-call payload"
+            ) from exc
+        if str(normed_content or "").strip():
+            raise RolloutProtocolError(
+                f"request {req.request_id} emitted non-tool text after </think>"
+            )
+        parsed_tool_calls = []
+        for tool_call in tool_calls:
+            function, has_decode_error = OpenAIFunctionCallSchema.from_openai_function_parsed_schema(
+                OpenAIFunctionParsedSchema(
+                    name=tool_call.name,
+                    arguments=tool_call.parameters,
+                )
+            )
+            if has_decode_error:
+                continue
+            parsed_tool_calls.append(
+                OpenAIFunctionToolCall(
+                    id=str(tool_call.tool_index),
+                    function=function,
+                )
+            )
+        if not parsed_tool_calls:
+            raise RolloutProtocolError(
+                f"request {req.request_id} emitted no decodable tool call"
+            )
+        self._validate_tool_calls(req, parsed_tool_calls)
+        return parsed_tool_calls
+
+    @staticmethod
+    async def _gather_rollout_requests(coroutines):
+        """Let sibling requests settle before propagating an infrastructure error.
+
+        A fail-fast gather can leave SGLang requests running while the sharding
+        manager starts releasing inference memory. Waiting for every sibling
+        prevents cleanup from racing an active scheduler request.
+        """
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
     async def _semaphore_wrapped_rollout(self, sem, req, do_sample, is_validate, **kwargs):
         async with sem:
-            return await self._async_rollout_a_request(req, do_sample, is_validate, **kwargs)
-        
+            try:
+                return await self._async_rollout_a_request(
+                    req, do_sample, is_validate, **kwargs
+                )
+            except Exception as exc:
+                if isinstance(exc, RolloutTemplateAlignmentError):
+                    return await self._quarantine_template_alignment(req, exc)
+                if isinstance(exc, RolloutProtocolError):
+                    return await self._quarantine_tool_protocol(req, exc)
+                if not self._is_length_exception(exc):
+                    raise
+                return await self._quarantine_length_exceeded(req, exc)
+
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
@@ -768,10 +1141,12 @@ class SGLangRollout(BaseRollout):
         while current_turns < self.config.multi_turn.max_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
                 await self._handle_pending_state(_req)
+                _req.record_length_event("initial_prompt")
                 _req.state = AsyncRolloutRequestStateEnum.RUNNING
             elif _req.state == AsyncRolloutRequestStateEnum.TOOL_CALLING:
                 if _req.messages[-1].tool_calls is not None:
                     parsed_tool_calls = _req.messages[-1].tool_calls
+                    self._validate_tool_calls(_req, parsed_tool_calls)
                     tool_call_results = await asyncio.gather(
                         *[
                             self._tool_map[tool_call.function.name].execute(
@@ -783,12 +1158,28 @@ class SGLangRollout(BaseRollout):
                             for tool_call in parsed_tool_calls
                         ]
                     )
+                    before_tool_response_tokens = len(_req.input_ids)
                     _req.add_tool_response_messages(
                         self.tokenizer,
                         [result[0] for result in tool_call_results],
                         tool_call_ids=[tool_call.id for tool_call in parsed_tool_calls],
                         names=[tool_call.function.name for tool_call in parsed_tool_calls],
                     )
+                    _req.record_length_event(
+                        "tool_response",
+                        tool_response_tokens=len(_req.input_ids) - before_tool_response_tokens,
+                        tool_response_count=len(tool_call_results),
+                    )
+                    if (
+                        len(_req.input_ids) > _req.max_model_len
+                        or len(_req.input_ids) - len(_req.prompt_ids) > _req.max_response_len
+                    ):
+                        raise RolloutLengthExceededError(
+                            f"request {_req.request_id} exceeded cumulative token budget "
+                            f"after tool response: context={len(_req.input_ids)}/"
+                            f"{_req.max_model_len}, response={len(_req.input_ids) - len(_req.prompt_ids)}/"
+                            f"{_req.max_response_len}"
+                        )
                     overall_stop = False
                     for tool_call, result in zip(parsed_tool_calls, tool_call_results):
                         # Keep compatibility with ordinary three-field tools;
@@ -802,6 +1193,11 @@ class SGLangRollout(BaseRollout):
                         conversation_histories[-1]["choice"] = choice
                         conversation_histories[-1]["reward"] = reward
                         conversation_histories[-1]["content"] = content
+                        turn_event = metrics.get("turn_event") if isinstance(metrics, dict) else None
+                        if isinstance(turn_event, dict):
+                            conversation_histories[-1].setdefault("turn_events", []).append(
+                                dict(turn_event)
+                            )
                         if is_done:
                             overall_stop = True
                     if overall_stop or len(_req.input_ids) >= self.config.max_model_len:
@@ -811,11 +1207,8 @@ class SGLangRollout(BaseRollout):
                 else:
                     raise ValueError(f"Unexpected tool calling last message state: {_req.messages[-1]}")
             elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
-                # Only continue the conversation if the prompt length is not greater than max_model_len - 1,
-                # since SGLang raises an error when max_new_tokens + 1 is greater to max_model_len (the extra token accounts for the EOS token).
-                if len(_req.get_generation_prompt_ids(self.tokenizer)) + 1 >= self.config.max_model_len:
-                    finish_reason_type = FinishReasonTypeEnum.LENGTH
-                    break
+                # The engine call computes the remaining cumulative budget and
+                # raises a typed length error when no safe turn can fit.
                 turn_boundaries.append(len(_req.input_ids))
                 conversation_histories.append({
                     "reward": 0.0,
@@ -823,52 +1216,93 @@ class SGLangRollout(BaseRollout):
                     "content": "",
                     "turn_idx": len(conversation_histories),
                 })
-                output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
-                content = output["text"]
-                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
-                current_turns += 1
-                if finish_reason_type == FinishReasonTypeEnum.LENGTH:
-                    _req.add_assistant_message(self.tokenizer, content)
-                    break
-                else:
-                    if self._function_call_parser and self._function_call_parser.has_tool_call(content):
-                        finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
-                        _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
-                        try:
-                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
-                        except JSONDecodeError:
-                            normed_content = content
-                            tool_calls = []
-                        except AttributeError:
-                            normed_content = content
-                            tool_calls = []
-                        parsed_tool_calls = []
-                        for tool_call in tool_calls:
-                            function, has_decode_error = OpenAIFunctionCallSchema.from_openai_function_parsed_schema(
-                                OpenAIFunctionParsedSchema(
-                                    name=tool_call.name,
-                                    arguments=tool_call.parameters,
-                                )
+                if _req.tool_schemas and self._function_call_parser:
+                    reasoning_prompt_ids = _req.get_generation_prompt_ids(self.tokenizer)
+                    reasoning_output = await self._handle_engine_call(
+                        _req,
+                        do_sample,
+                        is_validate,
+                        generation_prompt_ids=reasoning_prompt_ids,
+                        max_new_tokens_per_turn=self._max_reasoning_tokens_per_turn,
+                        phase="reasoning_generation",
+                        sampling_overrides={"stop": "</think>", "no_stop_trim": True},
+                        **kwargs,
+                    )
+                    reasoning_text = str(reasoning_output["text"] or "")
+                    reasoning_finish = FinishReasonTypeEnum.from_str(
+                        reasoning_output["meta_info"]["finish_reason"]["type"]
+                    )
+                    if "</think>" in reasoning_text:
+                        reasoning_content, trailing_content = reasoning_text.split("</think>", 1)
+                        if trailing_content.strip():
+                            raise RolloutProtocolError(
+                                f"request {_req.request_id} emitted text after the reasoning stop marker"
                             )
-                            # Drop the tool call if its arguments has decode error
-                            if has_decode_error:
-                                continue
-                            parsed_tool_calls.append(
-                                OpenAIFunctionToolCall(
-                                    id=str(tool_call.tool_index),
-                                    function=function,
-                                )
-                            )
-                        if len(parsed_tool_calls) > 0:
-                            _req.add_assistant_message(self.tokenizer, normed_content, tool_calls=parsed_tool_calls)
-                        else:
-                            _req.add_assistant_message(self.tokenizer, content)
-                            finish_reason_type = FinishReasonTypeEnum.STOP
-                            _req.state = AsyncRolloutRequestStateEnum.COMPLETED
-                            break
+                        forced_reasoning_end = False
                     else:
-                        _req.add_assistant_message(self.tokenizer, content)
-                        break
+                        reasoning_content = reasoning_text
+                        forced_reasoning_end = True
+                        _req.record_length_event(
+                            "forced_reasoning_end",
+                            reasoning_limit_reached=reasoning_finish == FinishReasonTypeEnum.LENGTH,
+                        )
+
+                    tool_call_prompt_ids = _req.build_tool_call_prompt_ids(
+                        self.tokenizer,
+                        reasoning_content,
+                    )
+                    tool_output = await self._handle_engine_call(
+                        _req,
+                        do_sample,
+                        is_validate,
+                        generation_prompt_ids=tool_call_prompt_ids,
+                        max_new_tokens_per_turn=self._max_tool_call_tokens_per_turn,
+                        phase="tool_call_generation",
+                        **kwargs,
+                    )
+                    tool_content = str(tool_output["text"] or "")
+                    tool_finish = FinishReasonTypeEnum.from_str(
+                        tool_output["meta_info"]["finish_reason"]["type"]
+                    )
+                    try:
+                        parsed_tool_calls = self._parse_tool_call_output(_req, tool_content)
+                    except RolloutProtocolError:
+                        if tool_finish == FinishReasonTypeEnum.LENGTH:
+                            raise RolloutLengthExceededError(
+                                f"request {_req.request_id} reached the tool-call generation cap "
+                                f"{self._max_tool_call_tokens_per_turn} before completing the protocol"
+                            ) from None
+                        raise
+                    _req.add_assistant_message(
+                        self.tokenizer,
+                        "",
+                        tool_calls=parsed_tool_calls,
+                        reasoning_content=reasoning_content,
+                        forced_reasoning_end=forced_reasoning_end,
+                    )
+                    self._assert_request_budget(_req)
+                    current_turns += 1
+                    finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
+                    _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
+                else:
+                    output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
+                    content = output["text"]
+                    finish_reason_type = FinishReasonTypeEnum.from_str(
+                        output["meta_info"]["finish_reason"]["type"]
+                    )
+                    current_turns += 1
+                    _req.add_assistant_message(self.tokenizer, content)
+                    self._assert_request_budget(_req)
+                    if finish_reason_type == FinishReasonTypeEnum.LENGTH:
+                        raise RolloutLengthExceededError(
+                            f"request {_req.request_id} reached the per-turn generation cap "
+                            f"{self._max_new_tokens_per_turn}"
+                        )
+                    if self._function_call_parser and self._function_call_parser.has_tool_call(content):
+                        raise RolloutProtocolError(
+                            f"request {_req.request_id} emitted a tool call without a tool schema"
+                        )
+                    break
 
         if current_turns >= self.config.multi_turn.max_turns:
             finish_reason_type = FinishReasonTypeEnum.STOP
@@ -896,18 +1330,41 @@ class SGLangRollout(BaseRollout):
             if metadata:
                 tool_reward_scores[f"{name}_reward_valid"] = float(bool(metadata.get("reward_valid", False)))
                 tool_reward_scores[f"{name}_terminal_only"] = float(bool(metadata.get("terminal_only", False)))
-                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate"):
+                for metric_name in TRAVEL_REWARD_METRIC_NAMES:
                     if metric_name in metadata:
                         tool_reward_scores[f"{name}_{metric_name}"] = float(metadata[metric_name])
-        _req.finalize(self.tokenizer, tool_reward_scores, turn_boundaries, conversation_histories, finish_reason_type)
+        _req.finalize(
+            self.tokenizer,
+            tool_reward_scores,
+            turn_boundaries,
+            conversation_histories,
+            finish_reason_type or FinishReasonTypeEnum.STOP,
+        )
 
         return _req
 
-    async def _handle_engine_call(self, _req: AsyncRolloutRequest, do_sample: bool, is_validate: bool, override_n: bool = True, **kwargs) -> dict:
-        generation_prompt_ids = _req.get_generation_prompt_ids(self.tokenizer)
-        # Adjust max_new_tokens to ensure it is not greater than max_model_len - 1
-        # SGLang raises an error when max_new_tokens + 1 is greater to max_model_len (the extra token accounts for the EOS token).
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1)
+    async def _handle_engine_call(
+        self,
+        _req: AsyncRolloutRequest,
+        do_sample: bool,
+        is_validate: bool,
+        override_n: bool = True,
+        generation_prompt_ids: list[int] | None = None,
+        max_new_tokens_per_turn: int | None = None,
+        phase: str = "generation",
+        sampling_overrides: dict | None = None,
+        **kwargs,
+    ) -> dict:
+        if generation_prompt_ids is None:
+            generation_prompt_ids = _req.get_generation_prompt_ids(self.tokenizer)
+        else:
+            generation_prompt_ids = list(generation_prompt_ids)
+        max_new_tokens = self._compute_generation_budget(
+            _req,
+            generation_prompt_ids,
+            max_new_tokens_per_turn=max_new_tokens_per_turn,
+            phase=phase,
+        )
         if not do_sample:
             kwargs = dict(
                 n=1,
@@ -919,7 +1376,7 @@ class SGLangRollout(BaseRollout):
                 top_k=-1,
                 ignore_eos=False,
                 min_new_tokens=0,
-                max_new_tokens=self.config.response_length,
+                max_new_tokens=max_new_tokens,
                 skip_special_tokens=True,
                 spaces_between_special_tokens=True,
             )
@@ -940,6 +1397,8 @@ class SGLangRollout(BaseRollout):
                 "n": 1,
             }
         kwargs["max_new_tokens"] = max_new_tokens
+        if sampling_overrides:
+            kwargs.update(sampling_overrides)
         if "n" not in kwargs or (kwargs["n"] > 1 and override_n):  # group size is supported in preprocess
             kwargs["n"] = 1
         # users can customize different sampling_params at different run
@@ -954,13 +1413,28 @@ class SGLangRollout(BaseRollout):
     async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
         if _req.tool_schemas is not None:
             tool_creation_coroutines = []
+            created_tools = []
             for tool_schema in _req.tool_schemas:
                 tool = self._tool_map[tool_schema.function.name]
                 create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
                 create_kwargs["max_turns"] = self.config["multi_turn"]["max_turns"]
                 create_kwargs["model_name"] = self.config["multi_turn"]["model_name"]
                 tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
+                created_tools.append(tool)
             await asyncio.gather(*tool_creation_coroutines)
+            initial_contexts = []
+            for tool in created_tools:
+                getter = getattr(tool, "get_initial_context", None)
+                if getter is None:
+                    continue
+                context = str(getter(_req.request_id)).strip()
+                if context:
+                    initial_contexts.append(context)
+            if initial_contexts:
+                _req.inject_initial_user_context(
+                    self.tokenizer,
+                    "\n\n".join(initial_contexts),
+                )
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -981,6 +1455,7 @@ class SGLangRollout(BaseRollout):
         tgt_device = prompts.batch["input_ids"].device
 
         sorted_output_req_list = None
+        rollout_error = None
 
         try:
             if self._tp_rank == 0:
@@ -997,8 +1472,8 @@ class SGLangRollout(BaseRollout):
                 sem = asyncio.Semaphore(128)  # Limit the concurrency of async requests to ensure the stability of the system
                 loop = asyncio.get_event_loop()
                 output_req_list = loop.run_until_complete(
-                    asyncio.gather(
-                        *[
+                    self._gather_rollout_requests(
+                        [
                             self._semaphore_wrapped_rollout(sem, req, do_sample, is_validate, **kwargs)
                             for req in req_list
                         ]
@@ -1011,17 +1486,20 @@ class SGLangRollout(BaseRollout):
         
         except Exception as e:
             logger.exception(f"[Rank {self._rank}] Rollout failed: {e}")
-            # Avoid hard crash, allow barrier to complete
+            rollout_error = f"{type(e).__name__}: {e}"
             sorted_output_req_list = None
 
-        # dist.barrier()
-        [sorted_output_req_list] = broadcast_pyobj(
-            data=[sorted_output_req_list],
+        # Broadcast the failure as data first so every TP rank exits together
+        # instead of turning a rank-0 error into a later NoneType exception.
+        rollout_error, sorted_output_req_list = broadcast_pyobj(
+            data=[rollout_error, sorted_output_req_list],
             rank=self._rank,
             dist_group=self._device_mesh_cpu["tp"].get_group(),
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+        if rollout_error is not None:
+            raise RuntimeError(f"SGLang rollout failed on the source rank: {rollout_error}")
         # Construct the batch data
         prompt_ids, response_ids = [], []
         prompt_attention_mask, response_attention_mask = [], []
@@ -1031,6 +1509,7 @@ class SGLangRollout(BaseRollout):
         conversation_histories = []  # Add conversation histories for new algorithm
         reward_scores = []
         turn_boundaries_list = []
+        length_summaries = []
         for req in sorted_output_req_list:
             assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
             assert len(req.input_ids) == len(req.attention_mask) == len(req.position_ids) == len(req.loss_mask), f"""Request {req.request_id} has different length of 
@@ -1048,12 +1527,13 @@ class SGLangRollout(BaseRollout):
             assert len(req.input_ids) <= self.config.max_model_len, error_message
 
             prompt_ids.append(torch.tensor(req.prompt_ids, dtype=torch.int, device=tgt_device))
-            response_ids.append(torch.tensor(req.response_ids, dtype=torch.int, device=tgt_device))
             if len(req.response_ids) > self.config.response_length:
-                logger.warning(
-                    f"""{req.request_id=} has response_ids length {len(req.response_ids)} 
-                    greater than max_response_len {self.config.response_length},\n{req=}"""
+                raise RuntimeError(
+                    f"Request {req.request_id} produced {len(req.response_ids)} response tokens, "
+                    f"exceeding configured response_length={self.config.response_length}; "
+                    "the trajectory is rejected instead of being silently padded or truncated"
                 )
+            response_ids.append(torch.tensor(req.response_ids, dtype=torch.int, device=tgt_device))
             prompt_attention_mask.append(torch.tensor(req.prompt_attention_mask, dtype=torch.int, device=tgt_device))
             response_attention_mask.append(torch.tensor(req.response_attention_mask, dtype=torch.int, device=tgt_device))
             prompt_position_ids.append(torch.tensor(req.prompt_position_ids, dtype=torch.int, device=tgt_device))
@@ -1063,6 +1543,9 @@ class SGLangRollout(BaseRollout):
             messages.append({"messages": req.messages})
             conversation_histories.append(req.conversation_histories)
             reward_scores.append(req.reward_scores)
+            length_summaries.append(
+                req.length_summary(finish_reason=req.finish_reason)
+            )
 
             # Convert turn boundaries to tensor format - FIXED: relative to response length
             response_length = len(req.response_ids)
@@ -1144,13 +1627,26 @@ class SGLangRollout(BaseRollout):
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self._engine.flush_cache()) 
 
+        length_monitor = {}
+        if length_summaries:
+            for key in length_summaries[0]:
+                values = [float(summary[key]) for summary in length_summaries]
+                length_monitor[f"mean_{key}"] = float(np.mean(values))
+                length_monitor[f"max_{key}"] = float(np.max(values))
+            length_monitor["invalid_rollouts"] = float(
+                sum(summary.get("invalid_rollout", 0.0) for summary in length_summaries)
+            )
         return DataProto(
             batch=batch,
             non_tensor_batch={
                 "messages": np.array(messages),
-                "conversation_histories": np.array([[x] for x in conversation_histories], dtype=object),
+                # Keep one complete history as one object per task row.  A
+                # nested np.array construction changes rank when a retry
+                # contains one row with a uniform history length.
+                "conversation_histories": make_1d_object_array(conversation_histories),
                 "reward_scores": np.array(reward_scores),
             },
+            meta_info={"travel_rollout_length": length_monitor},
         )
 
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[AsyncRolloutRequest]:
@@ -1175,6 +1671,7 @@ class SGLangRollout(BaseRollout):
                     _tools_kwargs = {}
                     _tool_schemas = None
 
+                response_token_buffer = int(self.config.multi_turn.get("response_token_buffer", 0) or 0)
                 req = AsyncRolloutRequest(
                     batch_data_id=data_idx,
                     rollout_offset=rollout_offset,
@@ -1191,7 +1688,7 @@ class SGLangRollout(BaseRollout):
                     response_loss_mask=[],
                     reward_scores={},
                     max_prompt_len=self.config.prompt_length,
-                    max_response_len=self.config.response_length,
+                    max_response_len=self.config.response_length + response_token_buffer,
                     max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
                     use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
                     enable_tokenization_sanity_check=self.config.multi_turn.enable_tokenization_sanity_check,

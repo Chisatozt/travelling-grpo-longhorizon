@@ -11,7 +11,13 @@ from pathlib import Path
 import yaml
 
 from sft.clean_travel_trajectories import clean_trajectory, is_sft_eligible
-from sft.qwen35_mask import assert_template_equivalence, exact_assistant_token_mask, template_messages
+from sft.qwen35_mask import (
+    assert_template_equivalence,
+    causal_target_mask,
+    exact_assistant_token_mask,
+    native_template_ids,
+    template_messages,
+)
 from sft.travel_canonical import canonical_hash, canonical_tools_schema, canonicalize_record, validate_canonical
 from verl.tools.travel_tool_adapter import format_environment_action, normalize_tool_call, sanitize_public_feedback
 from verl.trainer.ppo.hard_case_pool import HardCasePool, compose_task_key
@@ -120,6 +126,26 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.assertEqual(normalize_tool_call(call), {"choice": "answer", "content": "F1"})
         self.assertEqual(format_environment_action({"choice": "search", "content": "flight"}), "[search] flight")
         self.assertNotIn("Reward:", sanitize_public_feedback("Reward: 1.0\npublic feedback"))
+
+    def test_causal_target_mask_supervises_the_target_token(self):
+        # token_mask is aligned with input_ids. Causal losses predict
+        # input_ids[1:], so the first token-position mask must be discarded.
+        token_mask = [0, 0, 1, 1, 0]
+        self.assertEqual(causal_target_mask(token_mask), [0, 1, 1, 0])
+        predicted_tokens = [11, 12, 13, 14]
+        supervised = [token for token, keep in zip(predicted_tokens, causal_target_mask(token_mask)) if keep]
+        self.assertEqual(supervised, [12, 13])
+
+    def test_native_template_accepts_transformers_five_batch_encoding(self):
+        class MappingTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                del messages, kwargs
+                return {"input_ids": [[101, 102, 103]]}
+
+        self.assertEqual(
+            native_template_ids(MappingTokenizer(), [{"role": "user", "content": "hello"}]),
+            [101, 102, 103],
+        )
 
     def test_hard_case_pool_requires_three_valid_zero_groups(self):
         with tempfile.TemporaryDirectory() as directory:

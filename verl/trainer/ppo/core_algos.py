@@ -25,7 +25,10 @@ __all__ = [
     "compute_terminal_group_advantage",
     "compute_grpo_multiturn_advantage",
     "redistribute_terminal_turn_credit",
+    "compute_terminal_component_advantages",
+    "redistribute_behavior_component_turn_credit",
     "turn_credit_conservation_error",
+    "turn_credit_conservation_stats",
 ]
 
 from collections import defaultdict
@@ -816,15 +819,492 @@ def redistribute_terminal_turn_credit(
     return output
 
 
+
+def compute_terminal_component_advantages(
+    terminal_scores: torch.Tensor,
+    reward_components: torch.Tensor,
+    index: np.ndarray,
+    *,
+    reward_valid: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> torch.Tensor:
+    """Center terminal reward components with one shared GRPO denominator.
+
+    Each row of reward_components must sum to its terminal score. Using the
+    terminal-score standard deviation for every component guarantees that the
+    component advantages sum back to the ordinary trajectory advantage.
+    """
+    scores = terminal_scores.reshape(-1)
+    components = reward_components.to(device=scores.device, dtype=scores.dtype)
+    if components.ndim != 2 or components.shape[0] != scores.numel():
+        raise ValueError("reward_components must have shape [batch, components]")
+    valid = torch.ones(scores.numel(), dtype=torch.bool, device=scores.device)
+    if reward_valid is not None:
+        valid = reward_valid.to(device=scores.device).reshape(-1).bool()
+    valid = valid & torch.isfinite(scores) & torch.isfinite(components).all(dim=-1)
+    if not torch.allclose(
+        components.sum(dim=-1)[valid],
+        scores[valid],
+        atol=2e-5,
+        rtol=2e-5,
+    ):
+        raise ValueError("terminal reward components must sum to terminal_scores")
+
+    output = torch.zeros_like(components)
+    id2valid = defaultdict(list)
+    for row in range(scores.numel()):
+        if bool(valid[row]):
+            id2valid[index[row]].append(row)
+    for rows in id2valid.values():
+        values = scores[rows]
+        denominator = (
+            values.std(unbiased=False) + epsilon
+            if norm_adv_by_std_in_grpo and values.numel() > 1
+            else torch.tensor(1.0, device=scores.device, dtype=scores.dtype)
+        )
+        component_mean = components[rows].mean(dim=0)
+        output[rows] = (components[rows] - component_mean) / denominator
+        target = (values - values.mean()) / denominator
+        # Put floating-point closure error in the explicit residual component.
+        output[rows, -1] += target - output[rows].sum(dim=-1)
+    return output
+
+
+def _coalesce_turn_event(history_item) -> dict:
+    if not isinstance(history_item, dict):
+        return {}
+    raw_events = history_item.get("turn_events", [])
+    if isinstance(raw_events, dict):
+        raw_events = [raw_events]
+    events = [event for event in raw_events if isinstance(event, dict)]
+    if not events:
+        return {
+            "choice": str(history_item.get("choice", "")).casefold(),
+            "aspect": "",
+            "accepted": True,
+            "has_quality_event": False,
+        }
+    merged = {
+        "choice": str(history_item.get("choice", events[-1].get("choice", ""))).casefold(),
+        "aspect": str(events[-1].get("aspect", "")),
+        "accepted": all(bool(event.get("accepted", False)) for event in events),
+        "has_quality_event": True,
+    }
+    boolean_fields = (
+        "invalid_call",
+        "new_search",
+        "useful_action",
+        "no_gain_action",
+        "duplicate_action",
+        "redundant_action",
+        "completed_aspect",
+        "correct_answer",
+        "best_answer",
+        "legal_answer",
+        "wrong_answer",
+        "terminated",
+        "truncated",
+    )
+    for field in boolean_fields:
+        merged[field] = any(bool(event.get(field, False)) for event in events)
+    merged["new_preference_count"] = sum(
+        max(0, int(event.get("new_preference_count", 0) or 0))
+        for event in events
+    )
+    merged["termination_reason"] = str(events[-1].get("termination_reason", ""))
+    return merged
+
+
+def _normalized_turn_weights(weight_by_turn: dict[int, float], turn_count: int) -> list[float]:
+    values = [max(0.0, float(weight_by_turn.get(idx, 0.0))) for idx in range(turn_count)]
+    total = sum(values)
+    if total <= 0:
+        return [0.0] * turn_count
+    return [value / total for value in values]
+
+
+def _answer_chain_turn_weights(
+    events: list[dict],
+    *,
+    answer_flag: str,
+    search_share: float,
+    action_share: float,
+    answer_share: float,
+) -> list[float]:
+    routed: dict[int, float] = defaultdict(float)
+    answer_indices = [idx for idx, event in enumerate(events) if bool(event.get(answer_flag, False))]
+    for answer_idx in answer_indices:
+        aspect = str(events[answer_idx].get("aspect", ""))
+        searches = [
+            idx
+            for idx in range(answer_idx)
+            if events[idx].get("aspect") == aspect and bool(events[idx].get("new_search", False))
+        ]
+        actions = [
+            idx
+            for idx in range(answer_idx)
+            if events[idx].get("aspect") == aspect and bool(events[idx].get("useful_action", False))
+        ]
+        if searches:
+            routed[searches[0]] += search_share
+        else:
+            routed[answer_idx] += search_share
+        if actions:
+            per_action = action_share / len(actions)
+            for idx in actions:
+                routed[idx] += per_action
+        else:
+            routed[answer_idx] += action_share
+        routed[answer_idx] += answer_share
+    return _normalized_turn_weights(routed, len(events))
+
+
+def _behavior_component_turn_weights(
+    component_name: str,
+    component_advantage: float,
+    events: list[dict],
+    routing: dict | None = None,
+) -> list[float]:
+    routing = routing or {}
+    turn_count = len(events)
+    if turn_count == 0:
+        return []
+    answer_routes = {
+        "correct_completion": ("correct_answer", (0.15, 0.25, 0.60)),
+        "coverage_adjusted_answer_quality": ("best_answer", (0.10, 0.35, 0.55)),
+        "coverage_adjusted_legal_chain_rate": ("legal_answer", (0.25, 0.35, 0.40)),
+    }
+    custom_routes = routing.get("causal_routing", {}) if isinstance(routing, dict) else {}
+    if component_name in answer_routes and component_advantage >= 0:
+        flag, default_split = answer_routes[component_name]
+        split = custom_routes.get(component_name, default_split)
+        if len(split) != 3:
+            raise ValueError(f"causal route for {component_name} must contain three shares")
+        weights = _answer_chain_turn_weights(
+            events,
+            answer_flag=flag,
+            search_share=float(split[0]),
+            action_share=float(split[1]),
+            answer_share=float(split[2]),
+        )
+        if any(weights):
+            return weights
+
+    useful = {
+        idx: max(1.0, float(event.get("new_preference_count", 0) or 0))
+        for idx, event in enumerate(events)
+        if bool(event.get("useful_action", False))
+    }
+    progress = {
+        idx: 1.0
+        for idx, event in enumerate(events)
+        if bool(event.get("accepted", False))
+        and (
+            bool(event.get("new_search", False))
+            or bool(event.get("useful_action", False))
+            or bool(event.get("completed_aspect", False))
+        )
+    }
+    offenders = {
+        idx: 1.0
+        for idx, event in enumerate(events)
+        if bool(event.get("invalid_call", False))
+        or bool(event.get("wrong_answer", False))
+    }
+    redundant = {
+        idx: 1.0
+        for idx, event in enumerate(events)
+        if bool(event.get("redundant_action", False))
+        or bool(event.get("duplicate_action", False))
+    }
+    wasteful = dict(offenders)
+    for idx, value in redundant.items():
+        wasteful[idx] = wasteful.get(idx, 0.0) + value
+    # A first no-gain question has grace under the dedicated redundancy
+    # penalty, but it still explains wasted budget/efficiency. Give it half
+    # the blame of an explicitly invalid, duplicate, or redundant turn.
+    for idx, event in enumerate(events):
+        if bool(event.get("no_gain_action", False)) and idx not in redundant:
+            wasteful[idx] = wasteful.get(idx, 0.0) + 0.5
+
+    if component_name == "hidden_preference_hit_rate" and useful:
+        return _normalized_turn_weights(useful, turn_count)
+    if component_name == "policy_penalty" and component_advantage < 0 and offenders:
+        weighted = {
+            idx: 2.0 if bool(events[idx].get("wrong_answer", False)) else 1.0
+            for idx in offenders
+        }
+        return _normalized_turn_weights(weighted, turn_count)
+    if component_name == "redundant_action_penalty" and component_advantage < 0 and redundant:
+        return _normalized_turn_weights(redundant, turn_count)
+    if component_name in {"incomplete_penalty", "zero_answer_penalty", "max_steps_penalty"}:
+        if component_advantage < 0:
+            routed = {idx: 0.70 / len(wasteful) for idx in wasteful} if wasteful else {}
+            routed[turn_count - 1] = routed.get(turn_count - 1, 0.0) + 0.30
+            if not wasteful:
+                routed[turn_count - 1] = 1.0
+            return _normalized_turn_weights(routed, turn_count)
+        completed = {
+            idx: 1.0
+            for idx, event in enumerate(events)
+            if bool(event.get("completed_aspect", False))
+        }
+        return _normalized_turn_weights(completed or progress, turn_count)
+    if component_name == "clip_residual":
+        return _normalized_turn_weights({turn_count - 1: 1.0}, turn_count)
+    if component_advantage < 0:
+        negative_targets = wasteful or {
+            idx: 1.0
+            for idx, event in enumerate(events)
+            if bool(event.get("wrong_answer", False))
+        }
+        if negative_targets:
+            return _normalized_turn_weights(negative_targets, turn_count)
+        return _normalized_turn_weights({turn_count - 1: 1.0}, turn_count)
+    return _normalized_turn_weights(progress or {idx: 1.0 for idx in range(turn_count)}, turn_count)
+
+
+def redistribute_behavior_component_turn_credit(
+    terminal_advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: torch.Tensor,
+    conversation_histories: list | None,
+    component_advantages: torch.Tensor,
+    component_names: list[str] | tuple[str, ...],
+    *,
+    mix_ratio: float = 0.30,
+    routing: dict | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Route group-relative reward components to causally responsible turns.
+
+    The output preserves the original per-response token-advantage sum. Turn
+    totals are divided by each turns trainable-token count so verbose
+    reasoning does not receive more credit merely for being longer.
+    """
+    if not 0.0 <= float(mix_ratio) <= 1.0:
+        raise ValueError("turn credit mix_ratio must be between 0 and 1")
+    if component_advantages.shape != (terminal_advantages.shape[0], len(component_names)):
+        raise ValueError("component_advantages and component_names are misaligned")
+
+    behavior = torch.zeros_like(terminal_advantages)
+    diagnostic_values: dict[str, list[float]] = defaultdict(list)
+    for row in range(terminal_advantages.shape[0]):
+        valid_positions = torch.where(response_mask[row].bool())[0].tolist()
+        if not valid_positions:
+            continue
+        starts = sorted(set(torch.where(turn_boundaries[row].bool())[0].tolist()))
+        starts = [position for position in starts if position < response_mask.shape[1]]
+        if not starts or starts[0] > valid_positions[0]:
+            starts.insert(0, valid_positions[0])
+        ends = starts[1:] + [response_mask.shape[1]]
+        token_positions_by_turn = [
+            [pos for pos in valid_positions if start <= pos < end]
+            for start, end in zip(starts, ends)
+        ]
+        nonempty = [idx for idx, positions in enumerate(token_positions_by_turn) if positions]
+        if not nonempty:
+            continue
+
+        history = conversation_histories[row] if conversation_histories and row < len(conversation_histories) else []
+        if isinstance(history, dict):
+            history = [history]
+        events = [
+            _coalesce_turn_event(history[idx] if idx < len(history) else {})
+            for idx in range(len(starts))
+        ]
+        if not any(bool(event.get("has_quality_event", False)) for event in events):
+            behavior[row] = terminal_advantages[row]
+            diagnostic_values["fallback_rows"].append(1.0)
+            continue
+
+        turn_credits = torch.zeros(
+            len(starts),
+            device=terminal_advantages.device,
+            dtype=terminal_advantages.dtype,
+        )
+        for component_idx, component_name in enumerate(component_names):
+            value = component_advantages[row, component_idx]
+            weights = _behavior_component_turn_weights(
+                str(component_name),
+                float(value.detach().cpu()),
+                events,
+                routing,
+            )
+            # A generated turn can become entirely untrainable after
+            # masking (for example a forced close tag). Never strand component
+            # mass on such a turn; renormalize over trainable turns only.
+            weights = _normalized_turn_weights(
+                {
+                    idx: weights[idx]
+                    for idx in nonempty
+                    if weights and idx < len(weights) and weights[idx] > 0
+                },
+                len(starts),
+            )
+            if not any(weights):
+                weights = _normalized_turn_weights(
+                    {idx: 1.0 for idx in nonempty},
+                    len(starts),
+                )
+            turn_credits += value * torch.tensor(
+                weights,
+                device=turn_credits.device,
+                dtype=turn_credits.dtype,
+            )
+
+        total_tokens = float(len(valid_positions))
+        for turn_idx, token_positions in enumerate(token_positions_by_turn):
+            if not token_positions:
+                continue
+            behavior[row, token_positions] = (
+                total_tokens * turn_credits[turn_idx] / float(len(token_positions))
+            )
+
+        for turn_idx, event in enumerate(events):
+            value = float(turn_credits[turn_idx].detach().cpu())
+            if event.get("useful_action"):
+                diagnostic_values["useful_action_credit"].append(value)
+            if event.get("redundant_action") or event.get("duplicate_action"):
+                diagnostic_values["redundant_action_credit"].append(value)
+            if event.get("wrong_answer"):
+                diagnostic_values["wrong_answer_credit"].append(value)
+            if event.get("new_search"):
+                diagnostic_values["new_search_credit"].append(value)
+
+    # Record the raw routing error so train mode can distinguish harmless
+    # float rounding from a real component/routing mismatch before projection.
+    preprojection = turn_credit_conservation_stats(
+        terminal_advantages,
+        behavior,
+        response_mask,
+    )
+    # Close the routed and final mixed sums in float64, then put the residual
+    # on one trainable token. Spreading a sub-ULP correction over thousands of
+    # float32 tokens can otherwise leave a visible 1e-3 trajectory-sum error.
+    behavior = _project_trajectory_credit_sum(
+        behavior,
+        terminal_advantages,
+        response_mask,
+    )
+    mixed = (1.0 - float(mix_ratio)) * terminal_advantages + float(mix_ratio) * behavior
+    mixed = _project_trajectory_credit_sum(
+        mixed,
+        terminal_advantages,
+        response_mask,
+    )
+    diagnostics = {
+        f"mean_{name}": float(sum(values) / len(values))
+        for name, values in diagnostic_values.items()
+        if values
+    }
+    diagnostics["fallback_row_count"] = float(len(diagnostic_values.get("fallback_rows", [])))
+    diagnostics["mix_ratio"] = float(mix_ratio)
+    for event_name in (
+        "useful_action_credit",
+        "redundant_action_credit",
+        "wrong_answer_credit",
+        "new_search_credit",
+    ):
+        raw_name = f"mean_{event_name}"
+        if raw_name in diagnostics:
+            diagnostics[f"effective_{raw_name}"] = float(mix_ratio) * diagnostics[raw_name]
+    conservation = turn_credit_conservation_stats(
+        terminal_advantages,
+        mixed,
+        response_mask,
+    )
+    diagnostics.update(
+        {
+            "conservation_error": float(conservation["absolute_error"].detach().cpu()),
+            "conservation_abs_error": float(conservation["absolute_error"].detach().cpu()),
+            "conservation_relative_error": float(conservation["relative_error"].detach().cpu()),
+            "conservation_mean_token_error": float(conservation["mean_token_error"].detach().cpu()),
+            "conservation_finite": float(conservation["finite"].detach().cpu()),
+            "preprojection_abs_error": float(preprojection["absolute_error"].detach().cpu()),
+            "preprojection_relative_error": float(preprojection["relative_error"].detach().cpu()),
+            "preprojection_finite": float(preprojection["finite"].detach().cpu()),
+        }
+    )
+    return mixed, diagnostics
+
+
+def _project_trajectory_credit_sum(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Project each response onto the reference token-credit sum.
+
+    Sums are measured in float64 and the residual is assigned to the
+    smallest-magnitude trainable token. Two passes account for the final cast
+    back to the candidate dtype without perturbing every token in a long row.
+    """
+    if candidate.shape != reference.shape or candidate.shape != response_mask.shape:
+        raise ValueError("turn credit tensors and response_mask must have identical shapes")
+    projected = candidate.clone()
+    mask = response_mask.bool()
+    for row in range(projected.shape[0]):
+        positions = torch.where(mask[row])[0]
+        if positions.numel() == 0:
+            continue
+        row_values = projected[row, positions]
+        anchor = positions[torch.argmin(torch.abs(row_values))]
+        target = reference[row, positions].to(torch.float64).sum()
+        for _ in range(2):
+            actual = projected[row, positions].to(torch.float64).sum()
+            residual = target - actual
+            projected[row, anchor] = (
+                projected[row, anchor].to(torch.float64) + residual
+            ).to(projected.dtype)
+    return projected
+
+
+def turn_credit_conservation_stats(
+    original: torch.Tensor,
+    redistributed: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return float64 trajectory-sum conservation diagnostics.
+
+    Relative error is normalized by the larger masked L1 signal, rather than
+    by the signed sum, because positive and negative token credit can cancel.
+    """
+    if original.shape != redistributed.shape or original.shape != response_mask.shape:
+        raise ValueError("turn credit tensors and response_mask must have identical shapes")
+    mask = response_mask.bool()
+    original64 = torch.where(mask, original.to(torch.float64), 0.0)
+    redistributed64 = torch.where(mask, redistributed.to(torch.float64), 0.0)
+    absolute_by_row = torch.abs(original64.sum(dim=-1) - redistributed64.sum(dim=-1))
+    signal_scale = torch.maximum(
+        original64.abs().sum(dim=-1),
+        redistributed64.abs().sum(dim=-1),
+    ).clamp_min(1.0)
+    token_count = mask.sum(dim=-1).clamp_min(1).to(torch.float64)
+    finite = (
+        torch.isfinite(original64).all()
+        & torch.isfinite(redistributed64).all()
+        & torch.isfinite(absolute_by_row).all()
+    )
+    return {
+        "absolute_error": absolute_by_row.max(),
+        "relative_error": (absolute_by_row / signal_scale).max(),
+        "mean_token_error": (absolute_by_row / token_count).max(),
+        "finite": finite.to(torch.float64),
+    }
+
+
 def turn_credit_conservation_error(
     original: torch.Tensor,
     redistributed: torch.Tensor,
     response_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the maximum absolute per-response conservation error."""
-    original_sum = (original * response_mask).sum(dim=-1)
-    redistributed_sum = (redistributed * response_mask).sum(dim=-1)
-    return torch.max(torch.abs(original_sum - redistributed_sum))
+    """Return the float64 maximum absolute per-response conservation error."""
+    return turn_credit_conservation_stats(
+        original,
+        redistributed,
+        response_mask,
+    )["absolute_error"]
 
 
 def compute_grpo_multiturn_advantage(

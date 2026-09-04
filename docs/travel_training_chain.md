@@ -76,23 +76,30 @@ SFT 权重为 strict/recoverable=1，partial=0.5；totally_wrong、基础设施�
 ## GRPO 和 Reward
 
 TravelGym 的每个环境交互 step 返回 0；终局由私有 ledger 一次性计算
-`travelgym-terminal-v1`：
+`travelgym-terminal-v2`：
 
 ```text
 raw = 3.00 * correct_completion
-    + 0.30 * answer_quality
-    + 0.20 * legal_chain_rate
-    + 0.15 * hidden_preference_hit_rate
+    + 0.30 * (best_answers / requested_aspects)
+    + 0.20 * (legal_answer_chains / requested_aspects)
+    + 0.15 * agent_hidden_preference_hit_rate
     + 0.05 * efficiency
-    - policy_penalty
+    - total_penalty
 terminal = clip(raw / 3.70, -1, 1)
 ```
 
-`policy_penalty` 只在终局扣除非法工具调用、重复/跨 aspect、不可见 ID、错误答案、
-无输出和超步数。GRPO 的 rollout group 使用终局标量；当前配置固定采样，
-Hard Case Pool 不会触发重采样、batch 注入或训练。只有未来明确启用时才可使用
-独立的有界动态采样。Turn-level credit 默认 `off`，若实验需要，必须
-在终局 GRPO advantage 已确定后按守恒规则重分配，先 `off -> shadow -> train`。
+`total_penalty` 包含：非法调用 0.05/次与错误答案 0.10/次（合计上限 1.0）；
+每个 aspect 首次无收益询问宽限后，前三次冗余各 0.05、之后各 0.10（上限 0.60），
+完全相同的重复询问不享受宽限；未回答覆盖缺口按 `1-answer_coverage` 扣除，
+零答案额外扣 0.50，达到 `max_steps` 额外扣 0.75。模拟器主动透露偏好只计诊断，
+不计 agent elicitation 奖励。剩余步数仅够完成未回答链时，环境会拒绝新的 Action。
+
+GRPO 的 rollout group 使用终局标量；当前配置启用有界动态重采样，
+每次 update 最多生成 3 个 batch。`numerical_epsilon=1e-6` 只判定数值相等，
+`min_reward_spread=0.005` 则过滤会被标准差归一化放大的微小 shaping 差异。
+Hard Case Pool 仍不会触发重采样、batch 注入或训练。TurnCredit 默认在终局
+GRPO advantage 确定后按守恒规则进入 `train`；如需关闭，设置
+`algorithm.turn_credit.stage=off`。
 
 ## Hard Case Pool
 
@@ -114,4 +121,8 @@ python .\eval\check_qwen35_runtime.py --backend both --tokenizer Qwen/Qwen3.5-4B
 必须确认 Qwen3.5 tokenizer/template、`enable_thinking=true`、vLLM 的
 `qwen3_coder`/`qwen3` parser（或已验证的 SGLang 对应 parser）和工具 schema 完全
 一致。具体 SFT、Teacher 采集和合并命令见 `sft/README.md`；GRPO 启动脚本为
-`examples/sglang_multiturn/train.sh`。
+`examples/sglang_multiturn/train.sh`。策略模型的 smoke20/final200 评测统一通过
+`eval/native_validate.sh`：它以 `trainer.val_only=true` 启动同一 native SGLang
+两阶段 rollout，按 task 进行 pass@3 和 early stop，禁止 validation retry，结果
+以 step 0 的公开聚合指标写入 SwanLab。该 pass@3 只属于独立的策略评测；正式
+GRPO 使用 `validation_pass_k=1` 的普通 validation，step 0 仅读取这份 baseline。

@@ -31,6 +31,8 @@ except ModuleNotFoundError:  # direct ``python eval/final200.py`` execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from sft.task_pools import load_pool_manifest
 
+from verl.trainer.ppo.validation_passes import aggregate_validation_attempts
+
 
 class Final200Error(ValueError):
     pass
@@ -53,6 +55,7 @@ _TRACKED_METRICS = (
     "answer_coverage",
     "legal_chain_rate",
     "efficiency",
+    "pass_at_k",
 )
 
 
@@ -82,6 +85,36 @@ def _summarize_reports(reports: Iterable[Mapping[str, Any]]) -> dict[str, float]
     summary["completion_success_count"] = float(
         sum(_as_finite_float(row.get("completion_success", 0.0)) >= 1.0 for row in rows)
     )
+    return summary
+
+
+def _summarize_task_attempts(
+    attempts_by_task: Mapping[str, list[Mapping[str, Any]]],
+    *,
+    pass_k: int,
+) -> dict[str, float]:
+    """Return final200's public aggregate for task-level pass@k attempts."""
+    aggregate = aggregate_validation_attempts(attempts_by_task, pass_k=pass_k)
+    episodes = float(aggregate.get("task_count", 0.0))
+    summary: dict[str, float] = {
+        "episodes": episodes,
+        "pass_at_k": float(aggregate.get("pass_at_k", 0.0)),
+        "pass_count": float(aggregate.get("pass_count", 0.0)),
+        "attempt_count": float(aggregate.get("attempt_count", 0.0)),
+        "attempts_per_task": float(aggregate.get("attempts_per_task", 0.0)),
+        "early_stopped_tasks": float(aggregate.get("early_stopped_tasks", 0.0)),
+        "valid_attempt_rate": float(aggregate.get("valid_attempt_rate", 0.0)),
+    }
+    summary[f"pass@{int(pass_k)}"] = summary["pass_at_k"]
+    for key in _EVAL_METRICS:
+        if key == "pass_at_k":
+            continue
+        summary[f"{key}_mean"] = float(
+            aggregate.get(f"{key}/mean@1", 0.0)
+        )
+    # This count is task-level pass count, while completion_success_mean is
+    # retained as the first-attempt compatibility metric above.
+    summary["completion_success_count"] = float(aggregate.get("pass_count", 0.0))
     return summary
 
 
@@ -116,9 +149,12 @@ def evaluate_final200(
     task keys, seed, simulator and tool schema.  The function never performs
     model/API discovery itself and never returns raw reports.
 
-    ``runner`` is called as ``runner(model_name=<ref>, task_key=<key>,
-    protocol=<plan protocol>)`` and must return a mapping containing public
-    scalar fields such as ``terminal_reward`` and ``completion_success``.
+    ``runner`` is called once per independent attempt as
+    ``runner(model_name=<ref>, task_key=<key>, protocol=<attempt protocol>)``;
+    the attempt number is included in that protocol.  It must return a mapping
+    containing public scalar fields such as ``terminal_reward`` and
+    ``completion_success``.  Task-level early stop is applied here, so a
+    runner should not implement a second pass@k loop internally.
     ``tracking_factory`` (when supplied) is called once per independent model
     run and once for the comparison run with ``name``, ``run_spec`` and
     ``protocol`` keyword arguments.  A factory can construct the repository's
@@ -151,6 +187,18 @@ def evaluate_final200(
         raise Final200Error("final200 unseen180 is not the complement of seen20")
     if not callable(runner):
         raise Final200Error("final200 runner must be callable")
+    try:
+        pass_k = int(protocol.get("pass_k", 1))
+    except (TypeError, ValueError) as exc:
+        raise Final200Error("final200 protocol.pass_k must be a positive integer") from exc
+    if pass_k < 1:
+        raise Final200Error("final200 protocol.pass_k must be a positive integer")
+    early_stop = bool(protocol.get("task_level_early_stop", True))
+    if int(protocol.get("validation_retry_attempts", 0)):
+        raise Final200Error(
+            "final200 task-level pass@k cannot use validation retries; "
+            "each attempt must be independent"
+        )
 
     result: dict[str, Any] = {
         "protocol": dict(protocol),
@@ -158,17 +206,34 @@ def evaluate_final200(
         "comparison": {},
         "task_count": {"all200": 200, "smoke20_seen": 20, "unseen180": 180},
     }
-    reports_by_model: dict[str, dict[str, Mapping[str, Any]]] = {}
+    reports_by_model: dict[str, dict[str, list[Mapping[str, Any]]]] = {}
     for model_name in model_names:
-        model_reports: dict[str, Mapping[str, Any]] = {}
+        model_attempts: dict[str, list[Mapping[str, Any]]] = {}
         for task_key in all_keys:
-            report = runner(model_name=str(models[model_name]), task_key=task_key, protocol=dict(protocol))
-            if not isinstance(report, Mapping):
-                raise Final200Error(f"runner returned a non-mapping report for {model_name}/{task_key}")
-            # ``report`` remains process-local and is reduced immediately;
-            # no raw trajectory is retained in the returned result.
-            model_reports[task_key] = report
-        reports_by_model[model_name] = model_reports
+            task_attempts: list[Mapping[str, Any]] = []
+            for attempt_number in range(1, pass_k + 1):
+                attempt_protocol = dict(protocol)
+                attempt_protocol["attempt"] = attempt_number
+                report = runner(
+                    model_name=str(models[model_name]),
+                    task_key=task_key,
+                    protocol=attempt_protocol,
+                )
+                if not isinstance(report, Mapping):
+                    raise Final200Error(
+                        f"runner returned a non-mapping report for {model_name}/{task_key}"
+                    )
+                # ``report`` remains process-local and is reduced immediately;
+                # no raw trajectory is retained in the returned result.
+                task_attempts.append(report)
+                if (
+                    early_stop
+                    and _as_finite_float(report.get("completion_success", 0.0))
+                    == 1.0
+                ):
+                    break
+            model_attempts[task_key] = task_attempts
+        reports_by_model[model_name] = model_attempts
         split_keys = {
             "all": set(all_keys),
             "smoke20_seen": seen_keys,
@@ -176,8 +241,15 @@ def evaluate_final200(
         }
         model_result: dict[str, Any] = {}
         for split_name, keys in split_keys.items():
-            summary = _summarize_reports(model_reports[key] for key in all_keys if key in keys)
-            model_result[split_name] = summary
+            selected_attempts = {
+                key: model_attempts[key]
+                for key in all_keys
+                if key in keys
+            }
+            model_result[split_name] = _summarize_task_attempts(
+                selected_attempts,
+                pass_k=pass_k,
+            )
         result["models"][model_name] = model_result
 
         tracker = None
@@ -192,7 +264,8 @@ def evaluate_final200(
                 for split_name, summary in model_result.items():
                     namespace = "all" if split_name == "all" else split_name
                     for metric in _TRACKED_METRICS:
-                        tracked[f"final200/{namespace}/{metric}"] = float(summary.get(f"{metric}_mean", 0.0))
+                        metric_key = "pass_at_k" if metric == "pass_at_k" else f"{metric}_mean"
+                        tracked[f"final200/{namespace}/{metric}"] = float(summary.get(metric_key, 0.0))
                 _tracker_log(tracker, tracked, step=0)
             
         finally:
@@ -203,8 +276,9 @@ def evaluate_final200(
     comparison: dict[str, float] = {}
     for split_name in ("all", "smoke20_seen", "unseen180"):
         for metric in _TRACKED_METRICS:
+            metric_key = "pass_at_k" if metric == "pass_at_k" else f"{metric}_mean"
             values = {
-                model_name: float(result["models"][model_name][split_name].get(f"{metric}_mean", 0.0))
+                model_name: float(result["models"][model_name][split_name].get(metric_key, 0.0))
                 for model_name in model_names
             }
             for model_name, value in values.items():
@@ -280,6 +354,31 @@ def build_final200_plan(
         "seed": int(seed),
         "user_simulator": "TravelGym-public-v1",
         "tool_schema": "interact_with_env-v1",
+        # final200 and smoke20 use the same native Qwen3.5/SGLang protocol.
+        "rollout_backend": "sglang",
+        "native_two_stage": True,
+        "template_prefill": "<think>",
+        "reasoning_max_tokens_per_turn": 2560,
+        "tool_call_max_tokens_per_turn": 512,
+        "max_new_tokens_per_turn": 4096,
+        "tool_response_token_reserve": 6144,
+        "template_token_reserve": 32,
+        "tool_call_parser": "qwen3_coder",
+        # pass@3 must use independent sampled attempts, not three greedy
+        # replays of the same prompt.
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "forced_reasoning_end": "</think>",
+        "forced_reasoning_end_loss_mask": 0,
+        "pass_k": 3,
+        "task_level_early_stop": True,
+        "validation_retry_attempts": 0,
+        # Qwen3.5's native template uses <|im_end|> as EOS; the native
+        # rollout gets this from the tokenizer, while the plan records it for
+        # auditability and prevents the generic HTTP path from being reused.
+        "eos_token_id": 248046,
     }
     return {
         "schema_version": "travelgym-final200-plan-v1",

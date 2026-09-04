@@ -20,15 +20,32 @@ TODO(zhangchi.usc1992)
 
 import os
 
+# ``torch.distributed.run`` may propagate ``OMP_NUM_THREADS=0`` from a
+# no-card/container boot environment. OpenMP rejects zero (and malformed
+# values), so normalize it before importing torch or initializing workers.
+try:
+    if int(os.environ.get("OMP_NUM_THREADS", "1")) <= 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
+except (TypeError, ValueError):
+    os.environ["OMP_NUM_THREADS"] = "1"
+
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
+import inspect
 import re
 import json
 import math
+from pathlib import Path
 from contextlib import nullcontext
 
+from dotenv import load_dotenv
+
+
+# Load repository-local credentials/settings without overriding values supplied
+# explicitly by the launcher or environment manager.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 import hydra
 import torch
 import torch.distributed
@@ -45,6 +62,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.dataset.dynamic_sft_batching import (
+    DynamicPaddingCollator,
+    LengthGroupedDistributedSampler,
+)
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
@@ -69,6 +90,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from sft.qwen35_mask import causal_target_mask
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -147,10 +169,35 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
-        # Keep every trajectory, including a final partial batch.  Dropping
-        # the tail would make the exact task-group split and sample weights
-        # depend on world size.
-        self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=False)
+        multiturn_config = config.data.get("multiturn", {})
+        dynamic_padding = bool(multiturn_config.get("dynamic_padding", False))
+        length_bucketing = dynamic_padding and bool(multiturn_config.get("length_bucketing", False))
+        collate_fn = None
+        if dynamic_padding:
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            collate_fn = DynamicPaddingCollator(
+                pad_token_id=pad_token_id,
+                pad_to_multiple_of=int(multiturn_config.get("pad_to_multiple_of", 128)),
+                max_length=int(config.data.max_length),
+            )
+
+        if length_bucketing:
+            if not hasattr(self.train_dataset, "get_sequence_lengths"):
+                raise TypeError("length_bucketing requires a dataset with get_sequence_lengths()")
+            self.train_sampler = LengthGroupedDistributedSampler(
+                self.train_dataset.get_sequence_lengths(),
+                local_batch_size=int(config.data.train_batch_size),
+                num_replicas=world_size,
+                rank=rank,
+                seed=int(config.trainer.seed),
+                mega_batch_mult=int(multiturn_config.get("length_bucket_size_multiplier", 50)),
+            )
+        else:
+            # Keep every trajectory, including a final partial batch. Dropping
+            # the tail would make the task split depend on world size.
+            self.train_sampler = DistributedSampler(
+                self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=False
+            )
         self.train_dataloader = DataLoader(
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
@@ -158,6 +205,7 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=False,
+            collate_fn=collate_fn,
         )
 
         self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=False)
@@ -168,6 +216,7 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=False,
+            collate_fn=collate_fn,
         )
 
     def _build_model_optimizer(self):
@@ -231,13 +280,25 @@ class FSDPSFTTrainer:
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+        # Qwen3.5 (Transformers 5) supports ``logits_to_keep``. Computing
+        # logits only at supervised target positions avoids materializing a
+        # [sequence, vocab] tensor for every token in a 20K+ trajectory.
+        try:
+            base_model = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+            self._supports_logits_to_keep = "logits_to_keep" in inspect.signature(base_model.forward).parameters
+        except (TypeError, ValueError):
+            self._supports_logits_to_keep = False
         log_gpu_memory_usage("After model allocation", logger=logger)
 
         mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
 
+        # FSDP2 applies its own class-name-based ``fully_shard`` policy below;
+        # the FSDP1 auto-wrap helper is not used and can reject optional
+        # vision classes listed by Qwen3.5 even for its text-only model.
+        wrap_policy_config = {"disable": True} if self.config.model.strategy == "fsdp2" else self.config.model.fsdp_config.wrap_policy
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
-            config=self.config.model.fsdp_config.wrap_policy,
+            config=wrap_policy_config,
             is_lora=self.config.model.get("lora_rank", 0) > 0,
         )
         if self.device_mesh.get_rank() == 0:
@@ -315,7 +376,7 @@ class FSDPSFTTrainer:
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
+        loss_mask = causal_target_mask(batch.pop("loss_mask")).reshape(-1).to(self.device_name)
         # These masks are produced from the same Qwen native token stream as
         # ``loss_mask``.  They are diagnostics only: optimization still uses
         # the authoritative Assistant mask, while the span masks report
@@ -327,7 +388,7 @@ class FSDPSFTTrainer:
                 span_masks[field] = torch.zeros_like(loss_mask)
             else:
                 value = value.to(self.device_name, dtype=torch.float32)
-                span_masks[field] = value[:, :-1].reshape(-1)
+                span_masks[field] = causal_target_mask(value).reshape(-1)
         # Canonical Travel SFT carries one scalar weight per complete
         # trajectory (strict/recoverable=1, partial=0.5).  It stays outside
         # the chat template and scales both token numerator and denominator.
@@ -349,18 +410,38 @@ class FSDPSFTTrainer:
         context = self.sharding_manager if use_sp else nullcontext()
         with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             if not use_sp:
-                # Standard forward pass without sequence parallel
-                labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
-                logits = output.logits
-
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels.contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
+                # Standard forward pass without sequence parallel. Qwen3.5
+                # can avoid the very large [batch, sequence, vocab] logits
+                # tensor by returning logits only at supervised positions.
+                batch_size = int(input_ids.shape[0])
+                loss_mask_2d = loss_mask.view(batch_size, -1)
+                if getattr(self, "_supports_logits_to_keep", False):
+                    keep_positions = torch.nonzero(loss_mask_2d.any(dim=0), as_tuple=False).flatten()
+                    if keep_positions.numel() == 0:
+                        # Keep the forward well-defined for a pathological
+                        # all-unsupervised batch; its loss remains zero.
+                        keep_positions = torch.zeros(1, dtype=torch.long, device=input_ids.device)
+                    output = self.fsdp_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        logits_to_keep=keep_positions,
+                    )
+                    logits = output.logits
+                    shift_labels = input_ids[:, 1:].index_select(1, keep_positions).reshape(-1)
+                    shift_logits = logits.reshape(-1, self.model.config.vocab_size)
+                    token_weight = token_weight.view(batch_size, -1).index_select(1, keep_positions).reshape(-1)
+                    for field in span_masks:
+                        span_masks[field] = (
+                            span_masks[field].view(batch_size, -1).index_select(1, keep_positions).reshape(-1)
+                        )
+                else:
+                    labels = input_ids[:, 1:].contiguous()
+                    output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
+                    logits = output.logits
+                    shift_logits = logits[..., :-1, :].contiguous().view(-1, self.model.config.vocab_size)
+                    shift_labels = labels.view(-1).to(shift_logits.device)
                 token_losses = loss_fct(shift_logits, shift_labels)
                 loss = token_losses * token_weight.to(token_losses.device)
             else:
@@ -488,7 +569,7 @@ class FSDPSFTTrainer:
         # Compute one denominator for the complete effective batch.  The
         # numerator is accumulated by backward() over micro-batches, so no
         # additional 1/N micro-batch scaling is applied below.
-        full_loss_mask = batch["loss_mask"][:, :-1].to(dtype=torch.float32)
+        full_loss_mask = causal_target_mask(batch["loss_mask"]).to(dtype=torch.float32)
         full_sample_weight = batch.get("sample_weight", None)
         if full_sample_weight is None:
             full_sample_weight = torch.ones((full_loss_mask.shape[0],), dtype=torch.float32)
@@ -571,7 +652,7 @@ class FSDPSFTTrainer:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
         supervised_tokens = float(full_loss_mask.sum().item())
-        weighted_tokens = float((full_loss_mask * full_sample_weight[:, None]).sum().item())
+        weighted_tokens = float((full_loss_mask.cpu() * full_sample_weight[:, None]).sum().item())
         masked_token_nll = (
             detail_totals["weighted_nll_sum"] / detail_totals["weighted_supervised_tokens"]
             if detail_totals["weighted_supervised_tokens"] > 0

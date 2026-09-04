@@ -627,7 +627,7 @@ class AsyncSGLangRollout(BaseRollout):
             if metadata:
                 tool_reward_scores[f"{name}_reward_valid"] = float(bool(metadata.get("reward_valid", False)))
                 tool_reward_scores[f"{name}_terminal_only"] = float(bool(metadata.get("terminal_only", False)))
-                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate"):
+                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate", "user_api_calls", "user_api_errors", "user_retries", "user_cache_hits", "user_judge_api_calls", "user_response_api_calls", "user_prompt_tokens", "user_completion_tokens", "user_total_tokens", "user_reasoning_tokens", "user_wall_time_seconds"):
                     if metric_name in metadata:
                         tool_reward_scores[f"{name}_{metric_name}"] = float(metadata[metric_name])
         _req.finalize(self.tokenizer, tool_reward_scores, finish_reason_type=finish_reason_type)

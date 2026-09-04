@@ -67,6 +67,21 @@ class DataProtoConfig(metaclass=_DataProtoConfigMeta):
 _padding_size_key = "_padding_size_key_x123d"
 
 
+def make_1d_object_array(values: list) -> np.ndarray:
+    """Store one arbitrary Python object per batch row without NumPy nesting.
+
+    ``np.array(values, dtype=object)`` still inspects nested list lengths and
+    can produce different ranks for a full batch and a one-row retry.  Batch
+    metadata such as conversation histories must keep a stable first-axis
+    shape, so assign each value into a preallocated object array explicitly.
+    """
+    values = list(values)
+    output = np.empty(len(values), dtype=object)
+    for index, value in enumerate(values):
+        output[index] = value
+    return output
+
+
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
     """Pad a DataProto to size divisible by size_divisor
 
@@ -697,8 +712,20 @@ class DataProto:
             else:
                 # Convert each row to list (if needed)
                 for row in arr:
-                    merged.append(list(row))  # force wrap row into list
-        return np.array(merged, dtype=object)
+                    row = row.tolist() if isinstance(row, np.ndarray) else row
+                    # Older rollout batches wrapped each history in one
+                    # extra row.  Remove only that wrapper; a one-turn
+                    # history itself remains a list of one event.
+                    if (
+                        isinstance(row, (list, tuple))
+                        and len(row) == 1
+                        and isinstance(row[0], (list, tuple, np.ndarray))
+                    ):
+                        row = row[0]
+                        if isinstance(row, np.ndarray):
+                            row = row.tolist()
+                    merged.append(row)
+        return make_1d_object_array(merged)
 
     @staticmethod
     def concat(data: List["DataProto"]) -> "DataProto":

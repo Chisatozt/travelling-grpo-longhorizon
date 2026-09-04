@@ -1,5 +1,6 @@
 from typing import Any, Optional, Tuple
 import asyncio
+import os
 
 from .base_tool import BaseTool
 from .schemas import OpenAIFunctionToolSchema
@@ -10,6 +11,7 @@ from .travel_tool_adapter import (
     normalize_tool_call,
     sanitize_public_feedback,
 )
+from .travel_reward_metrics import TRAVEL_REWARD_METRIC_NAMES
 
 class InteractTool(BaseTool):
     """The persistent TravelGym tool used by SGLang multi-turn rollouts.
@@ -49,10 +51,14 @@ class InteractTool(BaseTool):
             )
         kwargs["max_turns"] = max_turns
         self._env_manager.create_environment(instance_id, env_name, **kwargs)
-        
+        initial_context = sanitize_public_feedback(
+            self._env_manager.get_initial_context(instance_id)
+        )
+
         # Initialize conversation state (separate from environment)
         self._conversation_data[instance_id] = {
             "history": [],
+            "initial_context": initial_context,
             "reward": 0.0,
             # TravelGym keeps correctness labels inside its private reward
             # ledger.  Do not copy rollout ground-truth IDs into this state.
@@ -62,6 +68,11 @@ class InteractTool(BaseTool):
         
         print(f"Created conversation {instance_id} with {env_name} environment")
         return instance_id
+
+    def get_initial_context(self, instance_id: str) -> str:
+        """Return reset-time public control state for the first Actor turn."""
+        state = self._conversation_data.get(instance_id)
+        return str(state.get("initial_context", "")) if state is not None else ""
 
     async def execute(self, instance_id: str, parameters: dict[str, Any], current_turns=0, **kwargs) -> Tuple[str, float, bool, str, str, dict]:
         """Execute action in the persistent environment.
@@ -82,6 +93,11 @@ class InteractTool(BaseTool):
         if env is None:
             raise ValueError(f"Environment for conversation {instance_id} not found")
         
+        # Snapshot only aggregate counters.  The derived event is trainer-only
+        # and never enters the model-visible observation.
+        snapshot_getter = getattr(env, "get_turn_credit_snapshot", None)
+        before_credit = snapshot_getter() if snapshot_getter is not None else {}
+
         # Normalize once at the API boundary.  The adapter does not inspect or
         # filter candidates; it only enforces the public choice/content shape.
         try:
@@ -90,37 +106,43 @@ class InteractTool(BaseTool):
             formatted_action = format_environment_action(normalized)
         except TravelToolAdapterError:
             feedback = "Tool call rejected: invalid tool parameters."
+            if hasattr(env, "register_external_invalid_call"):
+                env.register_external_invalid_call()
+            event_builder = getattr(env, "build_turn_credit_event", None)
+            turn_event = (
+                event_builder(before_credit, choice="")
+                if event_builder is not None
+                else {"choice": "", "invalid_call": True, "accepted": False}
+            )
             conversation_state = self._conversation_data[instance_id]
             conversation_state["history"].append({"choice": "", "content": "", "observation": {"feedback": feedback}})
-            return feedback, 0.0, False, "", "", {}
+            is_done = bool(turn_event.get("terminated", False) or turn_event.get("truncated", False))
+            return feedback, 0.0, is_done, "", "", {
+                "turn_event": turn_event
+            }
         
         try:
-            # Add timeout to prevent hanging for too long
+            step_timeout = float(os.environ.get("TRAVELGYM_STEP_TIMEOUT", "300"))
+            if step_timeout <= 0:
+                raise ValueError("TRAVELGYM_STEP_TIMEOUT must be positive")
             observation, reward, terminated, truncated, info = await asyncio.wait_for(
                 env.step_async(formatted_action),
-                timeout=30.0  # 30 seconds timeout
+                timeout=step_timeout,
             )
         except asyncio.TimeoutError:
-            print(f"Environment step timed out for {instance_id} after 30s")
-            # Fallback: Try in separate process to avoid NCCL interference
-            try:
-                print(f"Attempting fallback process isolation for {instance_id}")
-                result = await asyncio.to_thread(
-                    self._run_env_in_process, env, formatted_action
-                )
-                observation, reward, terminated, truncated, info = result
-            except Exception as e:
-                print(f"Process isolation fallback failed: {e}")
-                # Do not forward exception text.  Evaluator/model errors can
-                # contain private preference IDs or reward diagnostics.
-                observation = {"feedback": "The environment operation failed."}
-                reward, terminated, truncated, info = 0.0, True, False, {}
-        except Exception as e:
-            print(f"Environment step failed for {instance_id}: {e}")
+            print(f"Environment step timed out for {instance_id} after {step_timeout}s")
+            if hasattr(env, "mark_user_simulator_failure"):
+                env.mark_user_simulator_failure("outer_step_timeout")
+            observation = {"feedback": "The environment operation failed."}
+            reward, terminated, truncated, info = 0.0, False, True, {}
+        except Exception as exc:
+            print(f"Environment step failed for {instance_id}: {type(exc).__name__}")
+            if hasattr(env, "mark_user_simulator_failure"):
+                env.mark_user_simulator_failure(type(exc).__name__)
             # Return only neutral public text.  Raw exception strings are
             # internal diagnostics and must never enter the Actor transcript.
             observation = {"feedback": "The environment operation failed."}
-            reward, terminated, truncated, info = 0.0, True, False, {}
+            reward, terminated, truncated, info = 0.0, False, True, {}
 
         # Update conversation state
         conversation_state = self._conversation_data[instance_id]
@@ -143,26 +165,17 @@ class InteractTool(BaseTool):
         response_text = feedback
         
         is_done = terminated or truncated
+        event_builder = getattr(env, "build_turn_credit_event", None)
+        turn_event = (
+            event_builder(before_credit, choice=choice)
+            if event_builder is not None
+            else {"choice": choice, "accepted": True}
+        )
         print(f"Turn {current_turns}: Executed {choice} in conversation {instance_id} (Env: {current_env_name}), action: {formatted_action}, feedback: {feedback}, reward: {reward}, done: {is_done}")
 
-        return response_text, reward, is_done, choice, content, {}
-
-    def _run_env_in_process(self, env, formatted_action):
-        """Run environment step in separate process to isolate from NCCL context."""
-        try:
-            # Use synchronous step since we're in a separate process
-            if hasattr(env, 'step'):
-                return env.step(formatted_action)
-            else:
-                # If only async available, run in new event loop
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(env.step_async(formatted_action))
-        except Exception:
-            # Process errors are private diagnostics.  Return a neutral public
-            # observation so exception text cannot leak labels or IDs.
-            return {"feedback": "The environment operation failed."}, 0.0, True, False, {}
+        return response_text, reward, is_done, choice, content, {
+            "turn_event": turn_event
+        }
 
     async def calc_reward(self, instance_id: str, **kwargs) -> float:
         """Calculate final reward for the conversation.
@@ -210,16 +223,7 @@ class InteractTool(BaseTool):
             "terminal_only": True,
             "termination_reason": report.get("termination_reason"),
         }
-        for key in (
-            "correct_completion",
-            "answer_quality",
-            "legal_chain_rate",
-            "hidden_preference_hit_rate",
-            "efficiency",
-            "completion_success",
-            "answer_coverage",
-            "best_answer_rate",
-        ):
+        for key in TRAVEL_REWARD_METRIC_NAMES:
             try:
                 metadata[key] = float(report.get(key, 0.0))
             except (TypeError, ValueError):

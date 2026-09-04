@@ -93,7 +93,7 @@ config = TravelGymConfig(
     max_steps=25,
     verbose=True,
     data_mode="random",
-    reward_version="travelgym-terminal-v1",
+    reward_version="travelgym-terminal-v2",
     require_action_before_answer=False,
 )
 
@@ -108,7 +108,7 @@ env = TravelEnv(config)
 | `verbose` | Enable verbose logging | `False` | `True`/`False` |
 | `data_mode` | Scenario selection mode | `"random"` | `"random"`, `"single"`, `"list"` |
 | `data_source` | Specific scenario to use | `"random"` | Scenario key string or list |
-| `reward_version` | Terminal reward contract | `travelgym-terminal-v1` | Fixed value |
+| `reward_version` | Terminal reward contract | `travelgym-terminal-v2` | Fixed value |
 | `require_action_before_answer` | Require an evidence turn before Answer | `False` | `True`/`False` |
 | `search_failure_interval` | Simulate search errors every N calls | `5` | Any positive integer |
 | `elicitation_interval` | Proactive preference reveal interval | `3` | Any positive integer |
@@ -157,16 +157,26 @@ The environment supports comprehensive travel planning across multiple categorie
 
 ### Reward System
 
-TravelGym uses terminal-only `travelgym-terminal-v1` scoring. The bounded score is:
+TravelGym uses terminal-only `travelgym-terminal-v2` scoring. The bounded score is:
 
 ```text
 clip((3.00*correct_completion
-    + 0.30*answer_quality
-    + 0.20*legal_chain_rate
-    + 0.15*hidden_preference_hit_rate
+    + 0.30*coverage_adjusted_answer_quality
+    + 0.20*coverage_adjusted_legal_chain_rate
+    + 0.15*agent_hidden_preference_hit_rate
     + 0.05*efficiency
-    - policy_penalty) / 3.70, -1, 1)
+    - total_penalty) / 3.70, -1, 1)
 ```
+
+Quality and legal-chain credit are divided by all requested aspects, so leaving an
+aspect unanswered cannot preserve a perfect score. Hidden-preference credit is
+awarded only when the agent's question elicits it; proactive simulator reveals
+remain diagnostic-only.
+
+`total_penalty` combines invalid/wrong-answer policy penalties, redundant
+actions (one no-gain grace per aspect; exact duplicates are always redundant),
+missing answer coverage, a separate zero-answer penalty, and a max-step penalty.
+The coefficients are recorded in `eval/travel_manifest.json`.
 
 Interaction steps always return `0.0`; terminal diagnostics are available to the trainer/evaluator only. Candidate shrink, filter precision/recall/F1, preference IDs and correctness labels are not part of the Actor observation.
 

@@ -29,7 +29,7 @@ def compose_task_key(task_id: Any, env_name: Any | None = None) -> str:
 class HardCasePool:
     """Observe valid all-zero groups and persist three-group admissions."""
 
-    def __init__(self, path: str | Path, *, threshold: int = 3, reward_version: str = "travelgym-terminal-v1", enabled: bool = True, rank: int = 0):
+    def __init__(self, path: str | Path, *, threshold: int = 3, reward_version: str = "travelgym-terminal-v2", enabled: bool = True, rank: int = 0):
         if threshold <= 0:
             raise ValueError("threshold must be positive")
         self.path = Path(path)

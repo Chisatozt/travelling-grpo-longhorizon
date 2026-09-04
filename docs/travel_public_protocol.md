@@ -36,19 +36,20 @@ Reward ledger 完成整个 episode 后一次计算（step reward 恒为 0）：
 
 ```text
 raw = 3.00 * correct_completion
-    + 0.30 * answer_quality
-    + 0.20 * legal_chain_rate
-    + 0.15 * hidden_preference_hit_rate
+    + 0.30 * (best_answers / requested_aspects)
+    + 0.20 * (legal_answer_chains / requested_aspects)
+    + 0.15 * agent_hidden_preference_hit_rate
     + 0.05 * efficiency
-    - policy_penalty
+    - total_penalty
 terminal = clip(raw / 3.70, -1, 1)
 ```
 
-其中 `correct_completion` 是正确 Answer aspect 数除以总 aspect 数，
-`completion_success` 要求所有 aspect 都回答且正确；`answer_quality` 区分 best 和
-其他 correct，`legal_chain_rate` 检查 Search→Action→Answer，
-`hidden_preference_hit_rate` 与效率来自私有 ledger。非法调用、重复/跨 aspect、
-不可见 ID、错误答案、无输出和超步数只在终局 penalty 中体现。无效基础设施
+其中 `correct_completion`、best answer 和合法链都按总 aspect 数计算；
+`completion_success` 要求所有 aspect 都回答且正确。hidden preference 只奖励
+由 agent 问题实际引出的偏好，模拟器主动透露仅作为诊断。`total_penalty` 在终局
+累计非法调用与错误答案、宽限后的冗余 Action、未回答覆盖缺口、零答案以及
+`max_steps` 惩罚；精确重复询问不享受无收益宽限。剩余步数仅够完成未回答链时，
+控制器拒绝继续 Action。具体系数固定在 `eval/travel_manifest.json`。无效基础设施
 Reward 的 rollout 标记 `reward_valid=false`，训练器隔离。
 
 ## State machine

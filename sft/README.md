@@ -134,11 +134,22 @@ totally_wrong、infrastructure_invalid、overlength 不进入 SFT。
 ## 4. VERL LoRA SFT
 
 `verl/trainer/config/travel_qwen35_sft.yaml` 是权威配置，默认
-`Qwen/Qwen3.5-4B`、LoRA rank 16、32K、`truncation=error`、原生 Qwen template：
+`Qwen/Qwen3.5-4B`、LoRA rank 16、全局 trajectory batch 8、micro batch 1、
+3 epochs、32K 最大长度、`truncation=error` 和原生 Qwen template。490 条训练
+轨迹对应每 epoch 62 个 optimizer steps；每个 epoch 都保存 checkpoint，最终模型
+应结合 held-out TravelGym 成功率在 epoch 1/2/3 中选择，而不是固定使用最后一个。
+
+训练样本保持原始完整 token stream，不再逐条补到 32K。训练集先按原生 Qwen
+template 的精确 token 长度分桶并打乱 batch 顺序，再在每个本地 batch 内右侧补齐
+到最长轨迹（向上取 128 的倍数）；attention、position 和所有 loss mask 的 padding
+区域均为 0。32K 仍是硬上限，合法轨迹不会被截断。不要把不同 trajectory 直接
+拼成一条可互相 attention 的序列；若未来启用 sequence packing，必须使用隔离的
+attention block 和 position IDs。
+
+启动命令：
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
-  --config-path=verl/trainer/config \
   --config-name=travel_qwen35_sft \
   trainer.n_gpus_per_node=1 \
   model.partial_pretrain=Qwen/Qwen3.5-4B

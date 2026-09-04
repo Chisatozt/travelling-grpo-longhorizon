@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# TravelGym terminal-reward GRPO training.
+# Run this script from any working directory on the available GPU set.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "$REPOSITORY_ROOT/.venv-grpo/bin/python" ]]; then
+        PYTHON_BIN="$REPOSITORY_ROOT/.venv-grpo/bin/python"
+    else
+        PYTHON_BIN="$(command -v python3)"
+    fi
+fi
+
+# Load API/runtime configuration from the repository-root .env.  Values can be
+# overridden by exporting them after this block or by passing Hydra overrides.
+if [[ -f "$REPOSITORY_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPOSITORY_ROOT/.env"
+    set +a
+fi
+
+PROJECT_DIR="${PROJECT_DIR:-$REPOSITORY_ROOT}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+export MULTITURN_MODEL_NAME="${MULTITURN_MODEL_NAME:-${USER_MODEL_NAME:-gpt-4o}}"
+TRAINER_LOGGER="${TRAINER_LOGGER:-swanlab}"
+RUN_UNTIL_STEP="${RUN_UNTIL_STEP:-100}"
+USE_TRAIN_FILES_FOR_VAL="${USE_TRAIN_FILES_FOR_VAL:-false}"
+
+case "$TRAINER_LOGGER" in
+    swanlab|wandb|mlflow|tensorboard|clearml)
+        ;;
+    *)
+        echo "TRAINER_LOGGER must be one of swanlab, wandb, mlflow, tensorboard, clearml" >&2
+        exit 2
+        ;;
+esac
+TRACKING_LOGGERS="['console','${TRAINER_LOGGER}']"
+
+MODEL_PATH="${ACTOR_MODEL_PATH:-${MODEL_PATH:-Qwen/Qwen3.5-4B}}"
+if [[ -z "$MODEL_PATH" ]]; then
+    echo "ACTOR_MODEL_PATH (or MODEL_PATH) must point to the Actor checkpoint." >&2
+    exit 2
+fi
+
+IFS=',' read -ra GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-${#GPU_IDS[@]}}"
+CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
+
+# Read all eight authoritative variant splits.  The RLHFDataset applies the
+# task-pool filter before tokenisation, so validation receives the complete
+# final200 view instead of the legacy 50%-sampled aggregate parquet.
+TRAIN_FILES="[$PROJECT_DIR/data/travel22_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel33_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel44_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel233_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel333_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel334_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel444_multiturn_onechoice/train.parquet,$PROJECT_DIR/data/travel2222_multiturn_onechoice/train.parquet]"
+VAL_FILES="[$PROJECT_DIR/data/travel22_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel33_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel44_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel233_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel333_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel334_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel444_multiturn_onechoice/test.parquet,$PROJECT_DIR/data/travel2222_multiturn_onechoice/test.parquet]"
+
+if [[ "$USE_TRAIN_FILES_FOR_VAL" == "true" ]]; then
+    VAL_FILES="$TRAIN_FILES"
+fi
+
+set -x
+
+ulimit -n 65535
+
+# Keep the complete prompt+response sequence within the fixed 32768-token
+# Qwen3.5 context (1152 prompt + 31616 generated response).
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
+    --config-path="$CONFIG_PATH" \
+    --config-name='grpo_multiturn' \
+    algorithm.adv_estimator=grpo_multiturn \
+    algorithm.dynamic_sampling.enable=true \
+    algorithm.gamma=0.8 \
+    data.train_batch_size=8 \
+    data.max_prompt_length=1152 \
+    data.max_response_length=31616 \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    data.return_raw_chat=True \
+    actor_rollout_ref.model.path="$MODEL_PATH" \
+    actor_rollout_ref.model.lora_rank=16 \
+    actor_rollout_ref.model.lora_alpha=32 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.clip_ratio=0.2 \
+    actor_rollout_ref.actor.clip_ratio_low=0.15 \
+    actor_rollout_ref.actor.clip_ratio_high=0.25 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.model.enable_activation_offload=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.mode=sync \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.40 \
+    actor_rollout_ref.rollout.max_model_len=32768 \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.multi_turn.max_turns=25 \
+    actor_rollout_ref.rollout.multi_turn.model_name="$MULTITURN_MODEL_NAME" \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path="$CONFIG_PATH/tool_config/interact_tool_config.yaml" \
+    actor_rollout_ref.rollout.multi_turn.turn_level_method="off" \
+    actor_rollout_ref.rollout.multi_turn.trajectory_score_method="Terminal" \
+    actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.experiment_profile='production' \
+    trainer.logger="$TRACKING_LOGGERS" \
+    trainer.project_name='TravelGym' \
+    trainer.experiment_name='travelgym_qwen35_4b_terminal_bs8' \
+    trainer.n_gpus_per_node="$N_GPUS_PER_NODE" \
+    trainer.nnodes=1 \
+    trainer.save_freq=20 \
+    trainer.test_freq=5 \
+    trainer.val_before_train=False \
+    data.train_files="$TRAIN_FILES" \
+    data.val_files="$VAL_FILES" \
+    data.task_pool_manifest=$PROJECT_DIR/data/task_pools/travel_task_pools.json \
+    data.task_pool_name=grpo \
+    data.task_pool_train_name=grpo \
+    data.task_pool_val_name=validation \
+    data.task_pool_smoke_name=validation_smoke \
+    trainer.total_training_steps=100 \
+    trainer.run_until_step="$RUN_UNTIL_STEP" \
+    trainer.milestones='[20,40,60,80,100]' \
+    trainer.total_epochs=15 $@

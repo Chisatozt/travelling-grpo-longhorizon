@@ -844,8 +844,33 @@ trainer:
   # Whether to run validation before training begins
   val_before_train: True
 
+  # Disable all live and baseline validation for bounded diagnostic jobs.
+  disable_validation: False
+
   # Validation frequency (in training iterations)
   test_freq: -1
+  # Number of fresh-rollout retries for interaction rows whose terminal
+  # metadata reports reward_valid=false. Generic validation is unaffected.
+  validation_retry_attempts: 0
+
+  # Run validation only and exit before the PPO loop.  This is used by the
+  # native smoke20/final200 evaluator and is disabled for ordinary training.
+  val_only: False
+
+  # Number of independent task-level validation attempts.  The evaluator
+  # counts these as pass@k; invalid-row retries are a separate mechanism.
+  validation_pass_k: 1
+
+  # Remove a task after completion_success == 1 during pass@k validation.
+  validation_task_level_early_stop: True
+
+  # Optional output path for a step-0 native validation baseline.  Existing
+  # files are never overwritten.
+  validation_baseline_output_path: null
+
+  # Optional task-specific fail-fast check for obviously collapsed initial
+  # generations. Generic PPO workloads leave this disabled.
+  initial_rollout_health_gate: False
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0

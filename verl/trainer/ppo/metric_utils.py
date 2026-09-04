@@ -16,6 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 from collections import defaultdict
+from collections.abc import Mapping
 from functools import partial
 from typing import Any, Callable, Dict, List
 
@@ -23,6 +24,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from verl.tools.travel_reward_metrics import TRAVEL_QUALITY_METRIC_NAMES
 from verl.utils.import_utils import deprecated
 
 
@@ -75,6 +77,32 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
         prompt_length=prompt_length,
         response_length=response_length,
     )
+
+
+def compute_reward_component_metrics(
+    reward_extra_infos: Mapping[str, Any],
+    *,
+    prefix: str = "reward",
+) -> dict[str, float]:
+    """Return one SwanLab scalar for the final reward and each public component."""
+    metrics: dict[str, float] = {}
+
+    def numeric_values(raw: Any) -> np.ndarray:
+        try:
+            values = np.asarray(raw, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return np.asarray([], dtype=np.float64)
+        return values[np.isfinite(values)]
+
+    final_values = numeric_values(reward_extra_infos.get("reward"))
+    if final_values.size:
+        metrics[f"{prefix}/final"] = float(final_values.mean())
+
+    for name in TRAVEL_QUALITY_METRIC_NAMES:
+        values = numeric_values(reward_extra_infos.get(name))
+        if values.size:
+            metrics[f"{prefix}/components/{name}"] = float(values.mean())
+    return metrics
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
@@ -194,6 +222,44 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         metrics["terminal_reward/mean"] = sum(terminal_values) / len(terminal_values)
         metrics["terminal_reward/max"] = max(terminal_values)
         metrics["terminal_reward/min"] = min(terminal_values)
+
+    # DeepSeek User Simulator usage is carried as one numeric value per
+    # trajectory. Preserve both the step total (cost/throughput monitoring)
+    # and the per-trajectory mean (run-to-run comparison) in SwanLab.
+    user_metric_keys = (
+        "user_api_calls",
+        "user_api_errors",
+        "user_retries",
+        "user_cache_hits",
+        "user_judge_api_calls",
+        "user_response_api_calls",
+        "user_prompt_tokens",
+        "user_completion_tokens",
+        "user_total_tokens",
+        "user_reasoning_tokens",
+        "user_wall_time_seconds",
+    )
+    user_totals: dict[str, float] = {}
+    non_tensor = batch.non_tensor_batch if hasattr(batch, "non_tensor_batch") else {}
+    for key in user_metric_keys:
+        raw = non_tensor.get(key) if hasattr(non_tensor, "get") else None
+        if raw is None:
+            continue
+        try:
+            values = np.asarray(raw, dtype=np.float64).reshape(-1)
+            values = values[np.isfinite(values)]
+        except (TypeError, ValueError):
+            continue
+        if values.size == 0:
+            continue
+        short_name = key.removeprefix("user_")
+        total = float(values.sum())
+        user_totals[key] = total
+        metrics[f"user_simulator/{short_name}/sum"] = total
+        metrics[f"user_simulator/{short_name}/mean_per_trajectory"] = float(values.mean())
+    api_calls = user_totals.get("user_api_calls", 0.0)
+    if api_calls > 0:
+        metrics["user_simulator/api_error_rate"] = user_totals.get("user_api_errors", 0.0) / api_calls
     return metrics
 
 

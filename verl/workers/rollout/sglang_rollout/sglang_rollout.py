@@ -862,7 +862,7 @@ class SGLangRollout(BaseRollout):
             if metadata:
                 tool_reward_scores[f"{name}_reward_valid"] = float(bool(metadata.get("reward_valid", False)))
                 tool_reward_scores[f"{name}_terminal_only"] = float(bool(metadata.get("terminal_only", False)))
-                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate"):
+                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate", "user_api_calls", "user_api_errors", "user_retries", "user_cache_hits", "user_judge_api_calls", "user_response_api_calls", "user_prompt_tokens", "user_completion_tokens", "user_total_tokens", "user_reasoning_tokens", "user_wall_time_seconds"):
                     if metric_name in metadata:
                         tool_reward_scores[f"{name}_{metric_name}"] = float(metadata[metric_name])
         _req.finalize(self.tokenizer, tool_reward_scores, finish_reason_type=finish_reason_type)
@@ -912,11 +912,26 @@ class SGLangRollout(BaseRollout):
     async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
         if _req.tool_schemas is not None:
             tool_creation_coroutines = []
+            created_tools = []
             for tool_schema in _req.tool_schemas:
                 tool = self._tool_map[tool_schema.function.name]
                 create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
                 tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
+                created_tools.append(tool)
             await asyncio.gather(*tool_creation_coroutines)
+            initial_contexts = []
+            for tool in created_tools:
+                getter = getattr(tool, "get_initial_context", None)
+                if getter is None:
+                    continue
+                context = str(getter(_req.request_id)).strip()
+                if context:
+                    initial_contexts.append(context)
+            if initial_contexts:
+                _req.inject_initial_user_context(
+                    self.tokenizer,
+                    "\n\n".join(initial_contexts),
+                )
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()

@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from typing import Any
 
 
-REWARD_VERSION = "travelgym-terminal-v1"
+REWARD_VERSION = "travelgym-terminal-v2"
 PUBLIC_CONTROL_KEYS = {
     "current_aspect",
     "searched_aspects",
@@ -67,6 +67,23 @@ FORBIDDEN_PUBLIC_KEYS = {
     "reward_valid",
     "reward_valid_for_training",
     "policy_penalty",
+    "coverage_adjusted_answer_quality",
+    "coverage_adjusted_legal_chain_rate",
+    "unanswered_count",
+    "agent_elicited_preference_count",
+    "proactive_preference_count",
+    "useful_action_count",
+    "no_gain_action_count",
+    "redundant_action_count",
+    "duplicate_action_count",
+    "invalid_call_count",
+    "wrong_answer_count",
+    "redundant_action_penalty",
+    "incomplete_penalty",
+    "zero_answer_penalty",
+    "max_steps_reached",
+    "max_steps_penalty",
+    "total_penalty",
     "penalty_components",
     "quality_by_aspect",
     "chain_by_aspect",
@@ -131,18 +148,41 @@ def summarize_terminal_report(report: Mapping[str, Any]) -> dict[str, float | st
     """Return stable, non-label metrics for evaluation tables."""
     if report.get("reward_version") != REWARD_VERSION:
         raise TravelContractError("unexpected TravelGym reward version")
-    return {
+    summary: dict[str, float | str | bool] = {
         "terminal_reward": float(report.get("terminal_reward", 0.0)),
         "reward_valid": bool(report.get("reward_valid_for_training", report.get("reward_valid", False))),
-        "correct_completion": float(report.get("correct_completion", 0.0)),
-        "completion_success": float(report.get("completion_success", 0.0)),
-        "answer_coverage": float(report.get("answer_coverage", 0.0)),
-        "best_answer_rate": float(report.get("best_answer_rate", 0.0)),
-        "answer_quality": float(report.get("answer_quality", 0.0)),
-        "legal_chain_rate": float(report.get("legal_chain_rate", 0.0)),
-        "hidden_preference_hit_rate": float(report.get("hidden_preference_hit_rate", 0.0)),
-        "efficiency": float(report.get("efficiency", 0.0)),
     }
+    numeric_metrics = (
+        "raw_terminal_reward",
+        "correct_completion",
+        "completion_success",
+        "answer_coverage",
+        "unanswered_count",
+        "best_answer_rate",
+        "answer_quality",
+        "legal_chain_rate",
+        "coverage_adjusted_answer_quality",
+        "coverage_adjusted_legal_chain_rate",
+        "hidden_preference_hit_rate",
+        "agent_elicited_preference_count",
+        "proactive_preference_count",
+        "useful_action_count",
+        "no_gain_action_count",
+        "redundant_action_count",
+        "duplicate_action_count",
+        "invalid_call_count",
+        "wrong_answer_count",
+        "efficiency",
+        "policy_penalty",
+        "redundant_action_penalty",
+        "incomplete_penalty",
+        "zero_answer_penalty",
+        "max_steps_reached",
+        "max_steps_penalty",
+        "total_penalty",
+    )
+    summary.update({name: float(report.get(name, 0.0)) for name in numeric_metrics})
+    return summary
 
 
 __all__ = [

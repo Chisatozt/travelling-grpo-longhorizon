@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Check post-reset TravelGym prompt lengths with the production chat template."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from uuid import uuid4
+
+import pandas as pd
+import yaml
+from transformers import AutoTokenizer
+
+from verl.workers.rollout.schemas import AsyncRolloutRequest, AsyncRolloutRequestStateEnum
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MANIFEST = ROOT / "data/task_pools/travel_task_pools.json"
+DEFAULT_TOOL_CONFIG = (
+    ROOT / "examples/sglang_multiturn/config/tool_config/interact_tool_config.yaml"
+)
+
+
+def _messages(value) -> list[dict]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return [dict(message) for message in value]
+
+
+def _public_initial_context(env, task_id: str) -> str:
+    env.config.data_mode = "single"
+    env.config.data_source = task_id
+    observation, _ = env.reset()
+    feedback = observation.get("feedback", "") if isinstance(observation, dict) else str(observation or "")
+    marker = "Travel planning is ready."
+    marker_index = feedback.find(marker)
+    return (feedback[marker_index:] if marker_index >= 0 else feedback).strip()
+
+
+def scan_prompt_budget(
+    *,
+    model: Path,
+    manifest_path: Path,
+    tool_config_path: Path,
+    pools: tuple[str, ...],
+    max_prompt_length: int,
+) -> dict:
+    import travelgym
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tool_config = yaml.safe_load(tool_config_path.read_text(encoding="utf-8"))
+    tool_schemas = [entry["tool_schema"] for entry in tool_config["tools"]]
+
+    records = []
+    for pool in pools:
+        try:
+            pool_records = manifest["pools"][pool]["records"]
+        except KeyError as exc:
+            raise ValueError(f"unknown task pool: {pool}") from exc
+        records.extend((pool, record) for record in pool_records)
+
+    frames: dict[Path, pd.DataFrame] = {}
+    env_config = travelgym.get_default_config()
+    env_config.data_mode = "single"
+    env_config.user_simulator_mode = "local"
+    env = travelgym.TravelEnv(config=env_config)
+    lengths = []
+    violations = []
+    try:
+        for pool, record in records:
+            source_path = ROOT / record["source_path"]
+            if source_path not in frames:
+                frames[source_path] = pd.read_parquet(source_path)
+            frame = frames[source_path]
+            row = frame.iloc[int(record["source_index"])]
+            task_id = str(record["task_id"])
+            row_task_id = str(row["reward_model"]["id"])
+            if row_task_id != task_id:
+                raise ValueError(
+                    f"manifest/parquet mismatch for {record['task_key']}: {row_task_id}"
+                )
+            request = AsyncRolloutRequest(
+                request_id=str(uuid4()),
+                state=AsyncRolloutRequestStateEnum.PENDING,
+                messages=_messages(row["prompt"]),
+                tool_schemas=tool_schemas,
+                input_ids=[],
+                response_ids=[],
+                attention_mask=[],
+                response_attention_mask=[],
+                response_position_ids=[],
+                response_loss_mask=[],
+                reward_scores={},
+                max_prompt_len=100_000,
+                max_response_len=31_488,
+                max_model_len=100_000,
+                use_inference_chat_template=True,
+                enable_tokenization_sanity_check=True,
+                tokenizer=tokenizer,
+            )
+            request.inject_initial_user_context(
+                tokenizer,
+                _public_initial_context(env, task_id),
+            )
+            length = len(request.prompt_ids)
+            item = {
+                "pool": pool,
+                "task_key": record["task_key"],
+                "prompt_tokens": length,
+            }
+            lengths.append(item)
+            if length > max_prompt_length:
+                violations.append(item)
+    finally:
+        env.close()
+
+    ordered = sorted(lengths, key=lambda item: item["prompt_tokens"], reverse=True)
+    return {
+        "checked_records": len(lengths),
+        "pools": list(pools),
+        "max_prompt_length": max_prompt_length,
+        "observed_max_prompt_tokens": ordered[0]["prompt_tokens"] if ordered else 0,
+        "violations": violations,
+        "largest_prompts": ordered[:10],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", type=Path)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--tool-config", type=Path, default=DEFAULT_TOOL_CONFIG)
+    parser.add_argument("--pools", nargs="+", default=("grpo", "validation"))
+    parser.add_argument("--max-prompt-length", type=int, default=1280)
+    args = parser.parse_args()
+    report = scan_prompt_budget(
+        model=args.model,
+        manifest_path=args.manifest,
+        tool_config_path=args.tool_config,
+        pools=tuple(args.pools),
+        max_prompt_length=args.max_prompt_length,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["violations"]:
+        raise SystemExit(
+            f"{len(report['violations'])} post-reset prompts exceed "
+            f"max_prompt_length={args.max_prompt_length}"
+        )
+
+
+if __name__ == "__main__":
+    main()

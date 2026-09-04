@@ -49,6 +49,6 @@ ID、Action 次数、已回答 aspect 和公开对话历史。偏好 ID、正确
 
 SGLang/VERL 训练入口是 `examples/sglang_multiturn/train.sh`，评测入口是
 `eval/eval.py` 或 `eval/eval.sh`。终局 Reward 版本固定为
-`travelgym-terminal-v1`。
+`travelgym-terminal-v2`。
 
 更多状态机、奖励和隐私边界见 `docs/travel_public_protocol.md`。

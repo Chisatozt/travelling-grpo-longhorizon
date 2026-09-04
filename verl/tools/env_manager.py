@@ -22,6 +22,7 @@ class EnvironmentManager:
     def __init__(self) -> None:
         self._environments: Dict[str, Any] = {}
         self._env_configs: Dict[str, Dict[str, Any]] = {}
+        self._initial_contexts: Dict[str, str] = {}
 
     def create_environment(
         self,
@@ -38,9 +39,10 @@ class EnvironmentManager:
             logger.warning("Environment for request_id %s already exists", request_id)
             return request_id
 
-        env = self._create_travelgym_environment(**kwargs)
+        env, initial_context = self._create_travelgym_environment(**kwargs)
         self._environments[request_id] = env
         self._env_configs[request_id] = {"env_name": TRAVEL_GYM_NAME, "kwargs": kwargs}
+        self._initial_contexts[request_id] = initial_context
         logger.info("Created %s environment for request %s", TRAVEL_GYM_NAME, request_id)
         return request_id
 
@@ -48,18 +50,23 @@ class EnvironmentManager:
         """Return the environment associated with a conversation."""
         return self._environments.get(request_id)
 
+    def get_initial_context(self, request_id: str) -> str:
+        """Return the public reset context that must precede the first action."""
+        return self._initial_contexts.get(request_id, "")
+
     def release_environment(self, request_id: str) -> None:
         """Close and forget a conversation's environment."""
         env = self._environments.pop(request_id, None)
         self._env_configs.pop(request_id, None)
+        self._initial_contexts.pop(request_id, None)
         if env is not None and hasattr(env, "close"):
             env.close()
         if env is not None:
             logger.info("Released %s environment for request %s", TRAVEL_GYM_NAME, request_id)
 
     @staticmethod
-    def _create_travelgym_environment(**kwargs: Any) -> Any:
-        """Build a TravelGym configured for terminal-only public scoring."""
+    def _create_travelgym_environment(**kwargs: Any) -> tuple[Any, str]:
+        """Build TravelGym and retain the public part of its reset response."""
         import travelgym
 
         env_config = travelgym.get_default_config()
@@ -74,13 +81,35 @@ class EnvironmentManager:
             or os.environ.get("ACTOR_MODEL_NAME")
             or env_config.model_name
         )
+        env_config.user_simulator_mode = os.environ.get(
+            "TRAVELGYM_USER_SIMULATOR", env_config.user_simulator_mode
+        )
+        env_config.timeout = float(
+            os.environ.get(
+                "TRAVELGYM_USER_TIMEOUT",
+                os.environ.get("OPENAI_REQUEST_TIMEOUT", env_config.timeout),
+            )
+        )
         env_config.one_choice_per_aspect = True
         env_config.require_action_before_answer = False
-        env_config.reward_version = "travelgym-terminal-v1"
+        env_config.reward_version = "travelgym-terminal-v2"
 
         env = travelgym.TravelEnv(config=env_config)
-        env.reset()
-        return env
+        env._model_max_attempts = max(
+            1, int(os.environ.get("MODEL_MAX_ATTEMPTS", "3"))
+        )
+        observation, _ = env.reset()
+        feedback = (
+            observation.get("feedback", "")
+            if isinstance(observation, dict)
+            else str(observation or "")
+        )
+        # The task description is already present in the dataset prompt. Keep
+        # only the public control suffix so it is not duplicated for the Actor.
+        marker = "Travel planning is ready."
+        marker_index = feedback.find(marker)
+        initial_context = feedback[marker_index:] if marker_index >= 0 else feedback
+        return env, initial_context.strip()
 
 
 _env_manager = EnvironmentManager()

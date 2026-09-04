@@ -74,6 +74,9 @@ class MultiTurnSFTDataset(Dataset):
         self.assistant_train_mask_key = multiturn_config.get("assistant_train_mask_key", "assistant_train_mask")
         self.sample_weight_key = multiturn_config.get("sample_weight_key", "sample_weight")
         self.require_assistant_train_mask = bool(multiturn_config.get("require_assistant_train_mask", False))
+        self.dynamic_padding = bool(multiturn_config.get("dynamic_padding", False))
+        self.length_bucketing = bool(multiturn_config.get("length_bucketing", False))
+        self._sequence_lengths: list[int] | None = None
         # Legacy fallback for non-Travel datasets. Canonical Travel records use
         # the explicit per-message mask instead.
         self.train_last_assistant_only = bool(multiturn_config.get("train_last_assistant_only", False))
@@ -166,6 +169,20 @@ class MultiTurnSFTDataset(Dataset):
             enable_thinking=bool(enable_thinking),
             add_generation_prompt=add_generation_prompt,
         )
+
+    def get_sequence_lengths(self) -> list[int]:
+        """Return exact native-template lengths for length-grouped sampling."""
+
+        if self._sequence_lengths is None:
+            lengths = []
+            for item, messages in enumerate(self.messages):
+                tools = self.tools[item] if self.tools is not None else None
+                enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else True
+                lengths.append(len(self._template_ids(
+                    list(messages), tools=tools, enable_thinking=enable_thinking,
+                )))
+            self._sequence_lengths = lengths
+        return list(self._sequence_lengths)
 
     @staticmethod
     def _starts_with(sequence: list[int], prefix: list[int]) -> bool:
@@ -372,7 +389,7 @@ class MultiTurnSFTDataset(Dataset):
                 reasoning_loss_mask, tool_call_loss_mask = reasoning_loss_mask[: self.max_length], tool_call_loss_mask[: self.max_length]
             else:
                 raise ValueError(f"Unknown truncation method {self.truncation}")
-        elif sequence_length < self.max_length:
+        elif sequence_length < self.max_length and not self.dynamic_padding:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             pad = self.max_length - sequence_length
             input_ids = torch.cat((input_ids, torch.full((pad,), pad_token_id, dtype=input_ids.dtype)))

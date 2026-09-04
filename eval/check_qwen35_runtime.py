@@ -39,7 +39,13 @@ def check_transformers(tokenizer_path: str | None) -> list[dict[str, Any]]:
         if not template:
             return checks + [_result("qwen_template", False, "tokenizer has no chat_template")]
         signature = inspect.signature(tokenizer.apply_chat_template)
-        has_thinking = "enable_thinking" in signature.parameters
+        # Transformers exposes template-specific kwargs through **kwargs in
+        # some versions, so inspect both the signature and the local Jinja
+        # source instead of treating a missing explicit parameter as failure.
+        has_thinking = (
+            "enable_thinking" in signature.parameters
+            or "enable_thinking" in str(template)
+        )
         # Exercise the exact public tool schema and both completed/generation
         # renders.  Merely finding a ``chat_template`` is insufficient: a
         # tokenizer can silently ignore Qwen's thinking flag or render tool
@@ -55,27 +61,32 @@ def check_transformers(tokenizer_path: str | None) -> list[dict[str, Any]]:
             {"role": "user", "content": "Find a flight."},
         ]
         completed = tokenizer.apply_chat_template(
-            messages,
+            conversation=messages,
             tools=tools,
             tokenize=True,
             add_generation_prompt=False,
             enable_thinking=True,
         )
         generation = tokenizer.apply_chat_template(
-            messages,
+            conversation=messages,
             tools=tools,
             tokenize=True,
             add_generation_prompt=True,
             enable_thinking=True,
         )
-        if hasattr(completed, "tolist"):
-            completed = completed.tolist()
-        if hasattr(generation, "tolist"):
-            generation = generation.tolist()
-        if completed and isinstance(completed[0], list):
-            completed = completed[0]
-        if generation and isinstance(generation[0], list):
-            generation = generation[0]
+        def input_ids(value):
+            # apply_chat_template returns a BatchEncoding in current
+            # Transformers, while older builds returned a list/tensor.
+            if hasattr(value, "keys") and "input_ids" in value:
+                value = value["input_ids"]
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            while isinstance(value, list) and value and isinstance(value[0], list):
+                value = value[0]
+            return list(value or [])
+
+        completed = input_ids(completed)
+        generation = input_ids(generation)
         if not completed or not generation or generation[: len(completed)] != completed:
             raise ValueError("completed and generation Qwen template streams are not prefix-aligned")
         checks.append(

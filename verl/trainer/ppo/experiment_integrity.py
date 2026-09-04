@@ -10,7 +10,25 @@ class ExperimentIntegrityError(ValueError):
     pass
 
 
-def validate_run_until_step(run_until_step: int | None, total_training_steps: int = 200) -> int:
+TRAINING_STEP_POLICIES: dict[str, tuple[int, tuple[int, ...]]] = {
+    "production": (100, (20, 40, 60, 80, 100)),
+    "overfit_one": (10, (10,)),
+    "overfit_four": (20, (20,)),
+}
+
+
+def resolve_training_step_policy(profile: str | None) -> tuple[str, int, tuple[int, ...]]:
+    normalized = str(profile or "production").strip().casefold()
+    if normalized not in TRAINING_STEP_POLICIES:
+        raise ExperimentIntegrityError(
+            f"unknown trainer.experiment_profile {profile!r}; "
+            f"expected one of {tuple(TRAINING_STEP_POLICIES)}"
+        )
+    total_steps, allowed_steps = TRAINING_STEP_POLICIES[normalized]
+    return normalized, total_steps, allowed_steps
+
+
+def validate_run_until_step(run_until_step: int | None, total_training_steps: int = 100) -> int:
     value = total_training_steps if run_until_step is None else int(run_until_step)
     if value < 0 or value > int(total_training_steps):
         raise ExperimentIntegrityError(
@@ -22,16 +40,16 @@ def validate_run_until_step(run_until_step: int | None, total_training_steps: in
 def validate_process_run_until_step(
     run_until_step: int | None,
     *,
-    total_training_steps: int = 200,
-    allowed_steps: tuple[int, ...] = (5, 50, 200),
+    total_training_steps: int = 100,
+    allowed_steps: tuple[int, ...] = (20, 40, 60, 80, 100),
 ) -> int:
     """Validate the process-local GRPO stop points.
 
     ``total_training_steps`` is the experiment horizon used by the optimizer
     and scheduler.  A process may stop only at the explicitly supported
-    milestones so that the documented 5 -> 50 -> 200 resume protocol cannot
+    milestones so that the documented 20 -> 40 -> 60 -> 80 -> 100 resume protocol cannot
     accidentally be replaced by a partially trained, untracked horizon.
-    ``None`` means the full experiment horizon (200 by default).
+    ``None`` means the full experiment horizon (100 by default).
     """
 
     value = validate_run_until_step(run_until_step, total_training_steps)
@@ -43,7 +61,7 @@ def validate_process_run_until_step(
     return value
 
 
-def validate_total_training_steps(value: int | None, *, expected: int = 200) -> int:
+def validate_total_training_steps(value: int | None, *, expected: int = 100) -> int:
     """Require the fixed optimizer/scheduler horizon for this experiment."""
 
     resolved = expected if value is None else int(value)
@@ -96,6 +114,7 @@ __all__ = [
     "ExperimentIntegrityError",
     "capture_rng_state",
     "restore_rng_state",
+    "resolve_training_step_policy",
     "validate_process_run_until_step",
     "validate_run_until_step",
     "validate_total_training_steps",

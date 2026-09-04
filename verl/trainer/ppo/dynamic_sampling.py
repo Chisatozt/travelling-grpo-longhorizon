@@ -17,6 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+DEFAULT_NUMERICAL_EPSILON = 1.0e-6
+DEFAULT_MIN_REWARD_SPREAD = 5.0e-3
+
+
 def _as_python(value: Any) -> Any:
     return value.item() if hasattr(value, "item") else value
 
@@ -32,28 +36,74 @@ def _ordered_unique(values: Sequence[Any]) -> list[Any]:
     return ordered
 
 
+def resolve_reward_spread_thresholds(
+    config: Mapping[str, Any] | None,
+) -> tuple[float, float]:
+    """Resolve numerical equality and semantic reward-spread thresholds.
+
+    ``reward_tolerance`` is retained as a compatibility alias for the old
+    numerical-only setting. New configurations should use the two explicit
+    names so floating-point equality is not confused with useful GRPO signal.
+    """
+
+    config = config or {}
+    numerical_epsilon = float(
+        config.get(
+            "numerical_epsilon",
+            config.get("reward_tolerance", DEFAULT_NUMERICAL_EPSILON),
+        )
+    )
+    min_reward_spread = float(
+        config.get("min_reward_spread", DEFAULT_MIN_REWARD_SPREAD)
+    )
+    if numerical_epsilon < 0 or not math.isfinite(numerical_epsilon):
+        raise ValueError("numerical_epsilon must be finite and non-negative")
+    if min_reward_spread < 0 or not math.isfinite(min_reward_spread):
+        raise ValueError("min_reward_spread must be finite and non-negative")
+    return numerical_epsilon, min_reward_spread
+
+
+def _reward_spread_reason(
+    spread: float,
+    *,
+    numerical_epsilon: float,
+    min_reward_spread: float,
+) -> str | None:
+    if spread <= numerical_epsilon:
+        return "constant_reward"
+    if spread + numerical_epsilon < min_reward_spread:
+        return "insufficient_reward_spread"
+    return None
+
+
 def select_reward_varying_groups(
     uids: Sequence[Hashable],
     terminal_rewards: Sequence[float],
     *,
     reward_valid: Sequence[bool] | None = None,
     expected_group_size: int = 2,
-    tolerance: float = 1.0e-6,
+    numerical_epsilon: float = DEFAULT_NUMERICAL_EPSILON,
+    min_reward_spread: float = DEFAULT_MIN_REWARD_SPREAD,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Select rows from complete, valid, non-constant terminal groups.
+    """Select rows from complete, valid groups with useful reward spread.
 
     Rows with an invalid sibling remain available for diagnostics and for a
-    later bounded retry. Complete constant groups are dropped because they
-    cannot produce a GRPO relative advantage. No environment state is changed
-    by this helper.
+    later bounded retry. Numerically constant groups cannot produce a GRPO
+    relative advantage. Groups below ``min_reward_spread`` are also dropped so
+    standard-deviation normalization cannot amplify tiny shaping differences
+    into order-one advantages. No environment state is changed by this helper.
     """
 
     if len(uids) != len(terminal_rewards):
         raise ValueError("uids and terminal_rewards must have equal length")
     if expected_group_size <= 1:
         raise ValueError("expected_group_size must be greater than one")
-    if tolerance < 0 or not math.isfinite(tolerance):
-        raise ValueError("tolerance must be finite and non-negative")
+    numerical_epsilon, min_reward_spread = resolve_reward_spread_thresholds(
+        {
+            "numerical_epsilon": numerical_epsilon,
+            "min_reward_spread": min_reward_spread,
+        }
+    )
     if reward_valid is None:
         invalid = [False] * len(uids)
     else:
@@ -84,17 +134,22 @@ def select_reward_varying_groups(
     reasons = Counter()
     for uid, rows in grouped.items():
         clean = [row for row in rows if not invalid[row]]
+        reward_min = min(values[row] for row in rows)
+        reward_max = max(values[row] for row in rows)
+        reward_spread = reward_max - reward_min
         if len(rows) < expected_group_size:
             reason = "incomplete_group"
         elif any(invalid[row] for row in rows):
             reason = "reward_invalid"
-        elif max(values[row] for row in rows) - min(values[row] for row in rows) <= tolerance:
-            reason = "constant_reward"
         else:
-            reason = None
+            reason = _reward_spread_reason(
+                reward_spread,
+                numerical_epsilon=numerical_epsilon,
+                min_reward_spread=min_reward_spread,
+            )
         if reason is None:
             kept.extend(rows)
-        elif reason != "constant_reward":
+        elif reason in {"incomplete_group", "reward_invalid"}:
             # Clean rows are retained for diagnostics; the terminal advantage
             # reducer still excludes invalid/incomplete siblings.
             kept.extend(clean)
@@ -104,8 +159,9 @@ def select_reward_varying_groups(
             {
                 "uid": uid,
                 "indices": tuple(rows),
-                "reward_min": min(values[row] for row in rows),
-                "reward_max": max(values[row] for row in rows),
+                "reward_min": reward_min,
+                "reward_max": reward_max,
+                "reward_spread": reward_spread,
                 "reason": reason,
                 "trainable": reason is None,
             }
@@ -116,6 +172,8 @@ def select_reward_varying_groups(
         "kept_rows": len(kept),
         "trainable_group_count": sum(group["trainable"] for group in groups),
         "skipped_group_count": sum(not group["trainable"] for group in groups),
+        "numerical_epsilon": numerical_epsilon,
+        "min_reward_spread": min_reward_spread,
         "skip_reason_counts": dict(sorted(reasons.items())),
         "groups": tuple(groups),
     }
@@ -178,14 +236,20 @@ def _select_candidate_group(
     candidates: Sequence[_RolloutCandidate],
     *,
     expected_group_size: int,
-    tolerance: float,
+    numerical_epsilon: float,
+    min_reward_spread: float,
 ) -> tuple[_RolloutCandidate, ...] | None:
     """Choose a varied group without a combinatorial search."""
 
     if len(candidates) < expected_group_size:
         return None
     ordered = sorted(candidates, key=lambda item: (item.reward, item.generation_batch, item.row_index))
-    if ordered[-1].reward - ordered[0].reward <= tolerance:
+    reason = _reward_spread_reason(
+        ordered[-1].reward - ordered[0].reward,
+        numerical_epsilon=numerical_epsilon,
+        min_reward_spread=min_reward_spread,
+    )
+    if reason is not None:
         return None
 
     selected = [ordered[0]]
@@ -276,14 +340,11 @@ def install_verl_bounded_sampler(
     expected_group_size = int(config.get("group_size", group_size))
     max_batches = int(config.get("max_generation_batches", 3))
     max_skips = int(config.get("max_consecutive_skips", 10))
-    tolerance = float(config.get("reward_tolerance", 1.0e-6))
+    numerical_epsilon, min_reward_spread = resolve_reward_spread_thresholds(config)
     if expected_group_size != int(group_size):
         raise ValueError("dynamic sampler group_size must match rollout.n")
     if expected_group_size <= 1 or max_batches <= 0 or max_skips < 0:
         raise ValueError("invalid bounded-sampling configuration")
-    if tolerance < 0 or not math.isfinite(tolerance):
-        raise ValueError("reward_tolerance must be finite and non-negative")
-
     original = manager.generate_sequences
     state_by_batch_size: dict[int, BoundedSamplingState] = {}
 
@@ -342,9 +403,13 @@ def install_verl_bounded_sampler(
                 rewards,
                 reward_valid=[not value for value in invalid],
                 expected_group_size=expected_group_size,
-                tolerance=tolerance,
+                numerical_epsilon=numerical_epsilon,
+                min_reward_spread=min_reward_spread,
             )
             aggregate["constant_reward_group_count"] += stats["skip_reason_counts"].get("constant_reward", 0)
+            aggregate["insufficient_reward_spread_group_count"] += stats["skip_reason_counts"].get(
+                "insufficient_reward_spread", 0
+            )
             aggregate["invalid_group_count"] += stats["skip_reason_counts"].get("reward_invalid", 0)
             aggregate["incomplete_group_count"] += stats["skip_reason_counts"].get("incomplete_group", 0)
             for index, (uid, reward, bad) in enumerate(zip(uids, rewards, invalid)):
@@ -364,7 +429,8 @@ def install_verl_bounded_sampler(
                 selection = _select_candidate_group(
                     candidates[uid],
                     expected_group_size=expected_group_size,
-                    tolerance=tolerance,
+                    numerical_epsilon=numerical_epsilon,
+                    min_reward_spread=min_reward_spread,
                 )
                 if selection is not None:
                     selections[uid] = selection
@@ -387,8 +453,13 @@ def install_verl_bounded_sampler(
                 "accepted_groups": len(selections),
                 "candidate_count": sum(len(value) for value in candidates.values()),
                 "constant_reward_group_count": int(aggregate["constant_reward_group_count"]),
+                "insufficient_reward_spread_group_count": int(
+                    aggregate["insufficient_reward_spread_group_count"]
+                ),
                 "invalid_group_count": int(aggregate["invalid_group_count"]),
                 "incomplete_group_count": int(aggregate["incomplete_group_count"]),
+                "numerical_epsilon": numerical_epsilon,
+                "min_reward_spread": min_reward_spread,
                 "bounded": True,
             }
             return merged
@@ -402,8 +473,13 @@ def install_verl_bounded_sampler(
             "accepted_groups": 0,
             "candidate_count": sum(len(value) for value in candidates.values()),
             "constant_reward_group_count": int(aggregate["constant_reward_group_count"]),
+            "insufficient_reward_spread_group_count": int(
+                aggregate["insufficient_reward_spread_group_count"]
+            ),
             "invalid_group_count": int(aggregate["invalid_group_count"]),
             "incomplete_group_count": int(aggregate["incomplete_group_count"]),
+            "numerical_epsilon": numerical_epsilon,
+            "min_reward_spread": min_reward_spread,
             "bounded": True,
         }
         return last_output
@@ -415,6 +491,9 @@ def install_verl_bounded_sampler(
 
 __all__ = [
     "BoundedSamplingState",
+    "DEFAULT_MIN_REWARD_SPREAD",
+    "DEFAULT_NUMERICAL_EPSILON",
     "install_verl_bounded_sampler",
+    "resolve_reward_spread_thresholds",
     "select_reward_varying_groups",
 ]

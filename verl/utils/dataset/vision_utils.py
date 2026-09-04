@@ -17,12 +17,22 @@ from typing import Optional, Union
 
 import torch
 from PIL import Image
-from qwen_vl_utils import fetch_image, fetch_video
+
+try:
+    from qwen_vl_utils import fetch_image, fetch_video
+except ModuleNotFoundError:  # Pure-text datasets do not need the optional vision package.
+    fetch_image = None
+    fetch_video = None
 
 
 def process_image(image: Union[dict, Image.Image]) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.convert("RGB")
+
+    if fetch_image is None:
+        raise ModuleNotFoundError(
+            "qwen_vl_utils is required to process image inputs; install qwen-vl-utils."
+        )
 
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
@@ -70,6 +80,11 @@ def process_video(
 
     Add video sample FPS in a future MR
     """
+
+    if fetch_video is None:
+        raise ModuleNotFoundError(
+            "qwen_vl_utils is required to process video inputs; install qwen-vl-utils."
+        )
 
     if not isinstance(video, dict) or "video" not in video:
         raise NotImplementedError(VIDEO_FORMAT_HELP)

@@ -11,6 +11,9 @@ data:
   # artifact, but must not bypass the gold10 task isolation.
   train_files: sft/travel_sft_qwen35_split/train.jsonl
   val_files: sft/travel_sft_qwen35_split/val_gold10.jsonl
+  # Global trajectory batch. With 490 rows this gives 62 optimizer updates per
+  # epoch instead of inheriting the generic SFT default of 256 (2 updates).
+  train_batch_size: 8
   # Per-GPU micro batch size for the 4B LoRA SFT run.
   micro_batch_size_per_gpu: 1
   max_length: 32768
@@ -24,6 +27,12 @@ data:
     sample_weight_key: sample_weight
     require_assistant_train_mask: true
     train_last_assistant_only: false
+    # Preserve every native Qwen token while padding only to the longest
+    # trajectory in a length-homogeneous batch (rounded for kernel efficiency).
+    dynamic_padding: true
+    length_bucketing: true
+    pad_to_multiple_of: 128
+    length_bucket_size_multiplier: 50
 
 model:
   partial_pretrain: Qwen/Qwen3.5-4B
@@ -40,6 +49,7 @@ use_remove_padding: true
 trainer:
   project_name: TravelGym
   experiment_name: qwen35_4b_canonical_sft
+  # Keep all three epoch checkpoints and choose by held-out TravelGym metrics.
   total_epochs: 3
   logger: ['console', 'swanlab']
   validation_frequency: epoch

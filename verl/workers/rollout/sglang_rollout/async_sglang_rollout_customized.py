@@ -39,6 +39,7 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizer
 
 from verl import DataProto
+from verl.protocol import make_1d_object_array
 from verl.third_party.sglang import parallel_state as sglang_ps
 from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionParsedSchema, OpenAIFunctionToolCall
@@ -142,7 +143,12 @@ class AsyncSGLangRollout(BaseRollout):
             self.config.max_model_len = self.config.prompt_length + self.config.response_length
         assert self.config.max_model_len >= self.config.prompt_length + self.config.response_length, f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
             {self.config.max_model_len} >= {self.config.prompt_length} + {self.config.response_length}"""
-        assert model_hf_config.max_position_embeddings >= self.config.max_model_len, "model context length should be greater than total sequence length"
+        max_position_embeddings = getattr(model_hf_config, "max_position_embeddings", None)
+        if max_position_embeddings is None:
+            text_config = getattr(model_hf_config, "text_config", None)
+            max_position_embeddings = getattr(text_config, "max_position_embeddings", None)
+        assert max_position_embeddings is not None, "model config must expose max_position_embeddings"
+        assert max_position_embeddings >= self.config.max_model_len, "model context length should be greater than total sequence length"
         # currently max_turns stand for max number of tool calls
         if self.config.multi_turn.max_turns is None:
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
@@ -521,6 +527,11 @@ class AsyncSGLangRollout(BaseRollout):
                         conversation_histories[-1]["choice"] = choice
                         conversation_histories[-1]["reward"] = reward
                         conversation_histories[-1]["content"] = content
+                        turn_event = metrics.get("turn_event") if isinstance(metrics, dict) else None
+                        if isinstance(turn_event, dict):
+                            conversation_histories[-1].setdefault("turn_events", []).append(
+                                dict(turn_event)
+                            )
                         _req.update_metrics(metrics, tool_call.function.name)
                         if len(_req.input_ids) >= self.config.max_model_len:
                             break
@@ -668,7 +679,7 @@ class AsyncSGLangRollout(BaseRollout):
             if metadata:
                 tool_reward_scores[f"{name}_reward_valid"] = float(bool(metadata.get("reward_valid", False)))
                 tool_reward_scores[f"{name}_terminal_only"] = float(bool(metadata.get("terminal_only", False)))
-                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate"):
+                for metric_name in ("correct_completion", "answer_quality", "legal_chain_rate", "hidden_preference_hit_rate", "efficiency", "completion_success", "answer_coverage", "best_answer_rate", "user_api_calls", "user_api_errors", "user_retries", "user_cache_hits", "user_judge_api_calls", "user_response_api_calls", "user_prompt_tokens", "user_completion_tokens", "user_total_tokens", "user_reasoning_tokens", "user_wall_time_seconds"):
                     if metric_name in metadata:
                         tool_reward_scores[f"{name}_{metric_name}"] = float(metadata[metric_name])
 
@@ -838,7 +849,14 @@ class AsyncSGLangRollout(BaseRollout):
         if self.config.free_cache_engine and self._engine is not None and self._tp_rank == 0:
             self._engine.flush_cache()
 
-        return DataProto(batch=batch, non_tensor_batch={"messages": np.array(messages), "reward_scores": np.array(reward_scores), "conversation_histories": np.array(conversation_histories, dtype=object)})
+        return DataProto(
+            batch=batch,
+            non_tensor_batch={
+                "messages": np.array(messages),
+                "reward_scores": np.array(reward_scores),
+                "conversation_histories": make_1d_object_array(conversation_histories),
+            },
+        )
 
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[AsyncRolloutRequest]:
         assert "raw_prompt" in prompts.non_tensor_batch, "need data.return_raw_chat=True, due to no official way do parse_messages"
