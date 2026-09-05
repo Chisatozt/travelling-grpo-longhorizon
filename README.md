@@ -142,9 +142,9 @@ native evaluation 使用 SGLang 直接在评测进程中运行模型；HTTP 评�
 | --- | --- | ---: | ---: | ---: |
 | Qwen3.5-4B base（step 0） | Final-200 | 4.5%（9/200） | 0.1547 | 23.4% |
 | SFT-step186 | Final-200 | 11.5%（23/200） | 0.2946 | 41.4% |
-| GRPO-step100 | Final-200 | 30.5%（61/200） | 0.3987 | 52.3% |
+| GRPO-step100 | Final-200 | 47.0%（94/200） | 0.5713 | 66.1% |
 
-“正确 aspect 完成率”是每个任务中正确完成的 aspect 数除以该任务 aspect 总数，再在 200 个任务上取平均；它不同于要求所有 aspect 都完成的 `pass@1`。这组结果显示，SFT 先提升了基础的 aspect 级正确性，GRPO 进一步提高了 aspect 级完成率、完整任务成功率和平均终局 Reward。原始评测摘要保存在被忽略的本地 `outputs/` 运行目录中，表格是 README 中的固定汇总。
+“正确 aspect 完成率”是每个任务中正确完成的 aspect 数除以该任务 aspect 总数，再在 200 个任务上取平均；它不同于要求所有 aspect 都完成的 `pass@1`。这组结果显示，SFT 先提升了基础的 aspect 级正确性，GRPO 进一步提高了 aspect 级完成率、完整任务成功率和平均终局 Reward。评测摘要保存在被忽略的本地 `outputs/` 运行目录中，GRPO-step100 的摘要路径为 `outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/validation/100_pass1_summary.json`，表格是 README 中的固定汇总。
 
 ## 训练硬件与耗时
 

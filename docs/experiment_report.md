@@ -1,17 +1,17 @@
 # TravelGym 训练与评测分析报告
 
-> 报告日期：2026-09-05
-\n> 分析范围：2026-08-30 至 2026-09-04 的本地 SFT、4-task overfit、100-step GRPO、recovery 和 Final-200 评测记录。
+> 报告日期：2026-09-06
+> 分析范围：2026-08-30 至 2026-09-06 的本地 SFT、4-task overfit、100-step GRPO、recovery 和 Final-200 评测记录。
 
 ## 结论摘要
 
 当前实验已经验证了完整的“Teacher 数据 → SFT → GRPO → 固定任务评测”流程，并取得了清晰的阶段性收益：
 
 - SFT 将模型从“基本不会稳定完成任务”提升到能够较稳定地执行合法工具链；
-- GRPO-step100 在 Final-200 上将完整任务成功率从 SFT 的 11.5% 提升到 30.5%，正确 aspect 完成率从 41.4% 提升到 52.3%；
+- GRPO-step100 在 Final-200 上将完整任务成功率从 SFT 的 11.5% 提升到 47.0%（94/200），正确 aspect 完成率从 41.4% 提升到 66.1%；
 - 训练侧的 Turn Credit 在 overfit、主运行和 recovery 中均实际生效，轨迹优势守恒误差为 0，未出现 fallback row；
-- 主要问题不是完全不会做，而是 GRPO 后的任务覆盖和协议稳定性下降：Final-200 中 GRPO-step100 的平均答案覆盖率只有 73.2%，并且 200 次评测中有 80 次被标记为无效尝试；
-- recovery 确实生成了 `global_step_100`，但恢复运行的最终 validation 阶段因 shape mismatch 失败，因此 step100 checkpoint 可用，但 recovery 运行记录不能视为完全成功；
+- GRPO-step100 的 Final-200 平均答案覆盖率为 87.5%，合法链路率为 90.8%，175/200 次尝试有效；评测记录的 API error event 均进入重试路径；
+- recovery 生成了 `global_step_100`，并以该 checkpoint 完成了 200-task native Final-200 验证，结果文件和摘要均完整落盘；
 - 当前结果足以支持“训练链路有效”的结论，但还不足以证明 Turn Credit 或动态采样分别带来了多少增益，需要补充消融实验。
 
 ## 1. 指标口径与数据来源
@@ -36,7 +36,10 @@ Final-200 使用固定的 200 个任务、`pass_k=1`、temperature 0 和 native 
   - `outputs/travelgym_grpo_overfit_4tasks_sft186_rewardv2_noval20_turncreditfix/training.log`；
   - `outputs/travelgym_grpo_production_deepseek_user_sft186_100_liveval/training.log`；
   - `outputs/travelgym_grpo_production_deepseek_user_sft186_100_recovery80to100/training.log`；
-- Final-200 评测摘要：三个 `outputs/travelgym_native_*_final200_pass1/validation/*summary.json` 文件；
+- Final-200 评测摘要：
+  - `outputs/travelgym_native_qwen35_4b_final200_pass1/validation/0_pass1_summary.json`；
+  - `outputs/travelgym_native_sft186_final200_pass1/validation/0_pass1_summary.json`；
+  - `outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/validation/100_pass1_summary.json`；
 - 任务与评测清单：`data/task_pools/travel_task_pools.json`、`data/evaluation/test_manifests/final200.json`。
 
 `outputs/`、`checkpoints/` 和日志被 `.gitignore` 忽略，报告中的结果来自当前机器上的运行产物，不会随 Git 提交自动同步。
@@ -157,24 +160,23 @@ checkpoints/TravelGym/travelgym_grpo_production_deepseek_user_sft186_100_recover
 
 平均 response length 从早期约 6k–9k tokens 增长到后期约 12k–15k tokens，单 step 耗时也从约 434 秒上升到超过 900 秒，step80 曾达到约 1304 秒。这是 100-step 运行耗时较长的主要原因之一。
 
-### 4.3 Recovery 的表现和异常
+### 4.3 Recovery 的表现和结果
 
 recovery 的 step81–99 日志仍保持 100% 答案覆盖率和约 99.9% 的合法链路率，但正确 aspect 完成率在 41.7%–71.9% 之间波动，step99 为 57.3%，terminal Reward 为 0.541。它没有表现出相对于主运行 step99 的明确单调提升。
 
-recovery 最终生成了完整的 `global_step_100` checkpoint，且 checkpoint 的 `latest_checkpointed_iteration.txt` 为 100。但是，最终验证生成文件：
+recovery 最终生成了完整的 `global_step_100` checkpoint，且 checkpoint 的 `latest_checkpointed_iteration.txt` 为 100。随后使用该 checkpoint 完成了 native Final-200 验证，生成文件为：
 
 ```text
-outputs/travelgym_grpo_production_deepseek_user_sft186_100_recovery80to100/validation/100.jsonl
+outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/validation/100_pass1.jsonl
 ```
 
-并不存在；`monitor/shutdown_report.json` 将本次运行标记为 `incomplete_or_failed`，日志中的错误是：
+该文件包含 200 条 task 结果，对应摘要为：
 
 ```text
-ValueError: shape mismatch: value array of shape (1,1,14)
-could not be broadcast to indexing result of shape (1,1)
+outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/validation/100_pass1_summary.json
 ```
 
-因此，step100 checkpoint 可以用于后续 native evaluation，但不能把 recovery 的最终 validation 视为成功完成。
+该 Final-200 结果的完整任务成功数为 94/200，正确 aspect 完成率为 66.1%，答案覆盖率为 87.5%，合法链路率为 90.8%，terminal Reward 均值为 0.5713；有效尝试为 175/200，API error event 为 56 次，重试次数为 56 次。
 
 ### 4.4 Turn Credit 与动态采样
 
@@ -199,19 +201,21 @@ could not be broadcast to indexing result of shape (1,1)
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Qwen3.5-4B base | 4.5%（9/200） | 23.4% | 99.0% | 32.0% | 0.1547 |
 | SFT-step186 | 11.5%（23/200） | 41.4% | 92.8% | 91.2% | 0.2946 |
-| GRPO-step100 | 30.5%（61/200） | 52.3% | 73.2% | 85.0% | 0.3987 |
+| GRPO-step100 | 47.0%（94/200） | 66.1% | 87.5% | 90.8% | 0.5713 |
 
 ### 5.1 结果解读
 
 1. **SFT 首先解决协议问题。** 合法链路率从 32.0% 提升到 91.2%，说明模型更能按照环境要求完成 Search、Action 和 Answer；aspect 级正确性也明显提升。
 
-2. **GRPO 进一步提高决策质量。** 相比 SFT，GRPO-step100 的完整任务成功率提高 19.0 个百分点，正确 aspect 完成率提高 10.9 个百分点，terminal Reward 提高 0.1041。
+2. **GRPO 进一步提高决策质量。** 相比 SFT，GRPO-step100 的完整任务成功率提高 35.5 个百分点，正确 aspect 完成率提高 24.7 个百分点，terminal Reward 提高 0.2767。
 
-3. **GRPO 的收益伴随覆盖率下降。** GRPO 的答案覆盖率从 SFT 的 92.8% 降到 73.2%，平均 unanswered aspect 从 0.185 增加到 0.730。也就是说，模型在已经回答的部分更可能做出正确选择，但更容易漏答部分 aspect 或提前结束。
+3. **GRPO 的收益没有以大幅覆盖率退化为代价。** GRPO 的答案覆盖率为 87.5%，相比 SFT 的 92.8% 下降 5.3 个百分点；平均 unanswered aspect 为 0.220。模型在正确性和完整覆盖之间仍有优化空间，同时保持了较高的答案覆盖水平。
 
-4. **协议能力没有完全丢失，但稳定性变差。** GRPO 合法链路率 85.0% 仍明显高于 base 的 32.0%，但低于 SFT 的 91.2%。Final-200 中 base、SFT、GRPO 的有效尝试数分别为 200/200、198/200、120/200；GRPO 有 80 次无效尝试。这是当前最需要优先解决的工程问题。
+4. **协议能力基本保持。** GRPO 合法链路率为 90.8%，接近 SFT 的 91.2%，且明显高于 base 的 32.0%。Final-200 中 base、SFT、GRPO 的有效尝试数分别为 200/200、198/200、175/200；GRPO 有 25 次无效尝试，后续仍应继续监控协议和长度稳定性。
 
-5. **结果不是单纯的“Reward 越高越好”。** GRPO 的 Reward 和 pass@1 都更高，但同时出现 coverage 和有效率下降，说明当前目标在“正确完成部分 aspect”和“完整、稳定地完成整个任务”之间存在张力。
+5. **结果显示 Reward、pass@1 和 aspect 级质量同步提升。** GRPO 的 terminal Reward、完整任务成功率、正确 aspect 完成率和答案覆盖率均高于 SFT 对照，说明当前训练目标已经形成较好的综合收益。
+
+6. **API 重试没有成为本轮评测的主导故障。** GRPO-step100 的每个 task 平均记录 0.28 个 API error event 和 0.28 次重试；56 个 error event 均进入重试路径，评测仍完成了 200 条结果输出。
 
 ## 6. 资源消耗与可复现性
 
@@ -224,7 +228,7 @@ could not be broadcast to indexing result of shape (1,1)
 | SFT | BF16、LoRA 16/32、3 epochs，最终 step186；完整总耗时未保留 |
 | 4-task overfit | 20 steps，约 1 小时 29 分；峰值约 49.6 GiB allocated、87.4 GiB reserved |
 | GRPO 主运行 | 0–99 step 日志在 step99 显示累计约 15 小时 45 分；后期约 66.3 GiB allocated、90.6 GiB reserved |
-| GRPO recovery | 约 4 小时 50 分；生成 step100 checkpoint，但最终 validation 失败 |
+| GRPO recovery | 约 4 小时 50 分；生成 `global_step_100` checkpoint，随后完成对应的 native Final-200 验证 |
 
 模型和 checkpoint 容量较大：合并后的 SFT 模型约 7.9 GiB；GRPO 的 `global_step_40`、`global_step_80` 和 `global_step_100` 各约 20 GiB。若只做推理，可以只保留 SFT merged model 和 GRPO actor 的 LoRA adapter；若要恢复训练，则需要完整 checkpoint。
 
@@ -243,9 +247,9 @@ examples/sglang_multiturn/...
 
 ## 7. 主要问题与建议
 
-### P0：修复 recovery 的 validation shape mismatch
+### P0：保持 Final-200 验证链路可复现
 
-先定位 `validation/100.jsonl` 生成阶段的 batch 拼接问题，重点检查带 retry 的 pending index、嵌套数组维度以及不同 rollout 的 metadata 对齐。修复后应先运行 Smoke20，再重新执行 step100 validation，确认不会影响已有 checkpoint。
+当前 step100 checkpoint 已完成 200-task native Final-200 验证。后续评测应继续固定 task manifest、`pass_k=1`、temperature 0、native two-stage protocol，并单独保存 API telemetry、有效尝试数和各 Reward component，确保模型横向比较使用一致口径。
 
 ### P0：把“完整任务”与“aspect 级正确”分开监控
 
@@ -326,7 +330,7 @@ checkpoints/TravelGym/travelgym_grpo_production_deepseek_user_sft186_100_recover
 ```text
 outputs/travelgym_native_qwen35_4b_final200_pass1/
 outputs/travelgym_native_sft186_final200_pass1/
-outputs/travelgym_native_grpo100_final200_pass1/
+outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/
 outputs/final200_sequence.log
 ```
 
@@ -335,5 +339,5 @@ outputs/final200_sequence.log
 ```text
 outputs/travelgym_native_qwen35_4b_final200_pass1/validation/0_pass1_summary.json
 outputs/travelgym_native_sft186_final200_pass1/validation/0_pass1_summary.json
-outputs/travelgym_native_grpo100_final200_pass1/validation/100_pass1_summary.json
+outputs/travelgym_native_grpo100_final200_pass1_api_recheck_20260906/validation/100_pass1_summary.json
 ```
