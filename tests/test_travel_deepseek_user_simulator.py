@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "gyms" / "TravelGym"))
+sys.path.insert(0, str(ROOT / "environments" / "TravelGym"))
 
 import travelgym  # noqa: E402
 from travelgym.env.user_simulator import VAGUE_RESPONSE  # noqa: E402

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sft.sft_split import SFTSplitError, build_sft_split
+from travel_grpo.training.sft.sft_split import SFTSplitError, build_sft_split
 
 
 ENVS = ["travel22", "travel33", "travel44", "travel233", "travel333", "travel334", "travel444", "travel2222"]

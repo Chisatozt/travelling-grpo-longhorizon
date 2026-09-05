@@ -19,7 +19,7 @@ not trajectories, so a task may later receive multiple Teacher trajectories.
 Regenerate the deterministic partition with:
 
 ```powershell
-python .\sft\task_pools.py `
+python -m travel_grpo.collection.task_pools `
   --sft-target-count 600 `
   --output .\data\task_pools\travel_task_pools.json
 ```

@@ -212,9 +212,9 @@ class RLHFDataset(Dataset):
         self._task_pool_allowed: dict[str, set[tuple[str, str]]] | None = None
         if self.task_pool_manifest_path:
             try:
-                from sft.task_pools import load_pool_manifest
+                from travel_grpo.collection.task_pools import load_pool_manifest
             except ImportError as exc:  # pragma: no cover - package install path
-                raise RuntimeError("TravelGym task-pool filtering requires sft.task_pools") from exc
+                raise RuntimeError("TravelGym task-pool filtering requires travel_grpo.collection.task_pools") from exc
             pool_manifest = load_pool_manifest(
                 self.task_pool_manifest_path,
                 require_strict=self.task_pool_require_strict,

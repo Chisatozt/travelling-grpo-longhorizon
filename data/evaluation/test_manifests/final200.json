@@ -1,0 +1,1067 @@
+{
+  "manifest_version": "travelgym-test-set-v1",
+  "name": "travelgym-final200",
+  "split": "test",
+  "dataset_variant": "multiturn_onechoice",
+  "selection_strategy": "stratified_hash_v1",
+  "selection_seed": 20260801,
+  "source_task_count": 471,
+  "task_count": 200,
+  "source_name": "all eight TravelGym one-choice test splits (471 tasks)",
+  "source_env_counts": {
+    "travel22": 101,
+    "travel33": 87,
+    "travel44": 67,
+    "travel233": 61,
+    "travel333": 53,
+    "travel334": 47,
+    "travel444": 38,
+    "travel2222": 17
+  },
+  "selected_env_counts": {
+    "travel22": 43,
+    "travel33": 37,
+    "travel44": 28,
+    "travel233": 26,
+    "travel333": 23,
+    "travel334": 20,
+    "travel444": 16,
+    "travel2222": 7
+  },
+  "source_files": {
+    "travel22": {
+      "path": "data/grpo/travel22_multiturn_onechoice/test.parquet",
+      "task_count": 101
+    },
+    "travel33": {
+      "path": "data/grpo/travel33_multiturn_onechoice/test.parquet",
+      "task_count": 87
+    },
+    "travel44": {
+      "path": "data/grpo/travel44_multiturn_onechoice/test.parquet",
+      "task_count": 67
+    },
+    "travel233": {
+      "path": "data/grpo/travel233_multiturn_onechoice/test.parquet",
+      "task_count": 61
+    },
+    "travel333": {
+      "path": "data/grpo/travel333_multiturn_onechoice/test.parquet",
+      "task_count": 53
+    },
+    "travel334": {
+      "path": "data/grpo/travel334_multiturn_onechoice/test.parquet",
+      "task_count": 47
+    },
+    "travel444": {
+      "path": "data/grpo/travel444_multiturn_onechoice/test.parquet",
+      "task_count": 38
+    },
+    "travel2222": {
+      "path": "data/grpo/travel2222_multiturn_onechoice/test.parquet",
+      "task_count": 17
+    }
+  },
+  "records": [
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-55|restaurant:2-61",
+      "source_index": 53
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-5|restaurant:2-11",
+      "source_index": 30
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-18|apartment:2-45",
+      "source_index": 87
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-11|rental_car:2-3",
+      "source_index": 41
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-94|restaurant:2-57",
+      "source_index": 93
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-34|hotel:2-55",
+      "source_index": 24
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-68|restaurant:2-22",
+      "source_index": 15
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-5|rental_car:2-62",
+      "source_index": 66
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-21|restaurant:2-119",
+      "source_index": 64
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-90|rental_car:2-4",
+      "source_index": 31
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-73|restaurant:2-61",
+      "source_index": 10
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-25|hotel:2-43",
+      "source_index": 63
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-98|restaurant:2-98",
+      "source_index": 1
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-75|apartment:2-51",
+      "source_index": 7
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-5|rental_car:2-68",
+      "source_index": 71
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-51|rental_car:2-53",
+      "source_index": 46
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-7|restaurant:2-75",
+      "source_index": 75
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-13|hotel:2-20",
+      "source_index": 35
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-67|rental_car:2-27",
+      "source_index": 100
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-6|rental_car:2-49",
+      "source_index": 94
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-51|rental_car:2-7",
+      "source_index": 47
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-47|restaurant:2-25",
+      "source_index": 65
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-86|rental_car:2-60",
+      "source_index": 0
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-69|rental_car:2-19",
+      "source_index": 34
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-30|restaurant:2-2",
+      "source_index": 14
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-22|restaurant:2-38",
+      "source_index": 99
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-59|rental_car:2-71",
+      "source_index": 91
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-61|restaurant:2-33",
+      "source_index": 49
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-25|restaurant:2-98",
+      "source_index": 20
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-74|rental_car:2-36",
+      "source_index": 2
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-31|rental_car:2-9",
+      "source_index": 52
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-14|restaurant:2-113",
+      "source_index": 92
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-55|restaurant:2-76",
+      "source_index": 72
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-75|restaurant:2-58",
+      "source_index": 85
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-55|rental_car:2-5",
+      "source_index": 80
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-18|apartment:2-44",
+      "source_index": 25
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-15|apartment:2-58",
+      "source_index": 57
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-76|restaurant:2-70",
+      "source_index": 3
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-50|restaurant:2-10",
+      "source_index": 86
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "rental_car:2-62|restaurant:2-122",
+      "source_index": 38
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "flight:2-43|restaurant:2-89",
+      "source_index": 18
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "hotel:2-11|rental_car:2-33",
+      "source_index": 59
+    },
+    {
+      "env_name": "travel22",
+      "task_id": "apartment:2-39|restaurant:2-74",
+      "source_index": 40
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-181|rental_car:3-109",
+      "source_index": 1
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-152|restaurant:3-19",
+      "source_index": 2
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-66|restaurant:3-306",
+      "source_index": 9
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-240|restaurant:3-195",
+      "source_index": 60
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-29|restaurant:3-104",
+      "source_index": 10
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-245|hotel:3-2",
+      "source_index": 38
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-201|rental_car:3-101",
+      "source_index": 76
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-167|restaurant:3-214",
+      "source_index": 22
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "rental_car:3-142|restaurant:3-229",
+      "source_index": 77
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-53|rental_car:3-10",
+      "source_index": 86
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-203|hotel:3-145",
+      "source_index": 51
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-140|rental_car:3-42",
+      "source_index": 69
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-211|hotel:3-64",
+      "source_index": 71
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-53|restaurant:3-236",
+      "source_index": 20
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-176|restaurant:3-309",
+      "source_index": 23
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "rental_car:3-19|restaurant:3-116",
+      "source_index": 7
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "rental_car:3-137|restaurant:3-161",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-216|apartment:3-131",
+      "source_index": 0
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-286|restaurant:3-104",
+      "source_index": 63
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-94|restaurant:3-172",
+      "source_index": 72
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-275|restaurant:3-39",
+      "source_index": 50
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-117|restaurant:3-153",
+      "source_index": 52
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-247|restaurant:3-211",
+      "source_index": 41
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-17|rental_car:3-130",
+      "source_index": 34
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "rental_car:3-40|restaurant:3-97",
+      "source_index": 37
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-60|restaurant:3-164",
+      "source_index": 81
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-194|apartment:3-74",
+      "source_index": 6
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-51|rental_car:3-142",
+      "source_index": 27
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "apartment:3-134|restaurant:3-303",
+      "source_index": 79
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-187|hotel:3-149",
+      "source_index": 80
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-20|rental_car:3-102",
+      "source_index": 65
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-46|rental_car:3-40",
+      "source_index": 30
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "hotel:3-74|restaurant:3-135",
+      "source_index": 66
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "rental_car:3-158|restaurant:3-159",
+      "source_index": 28
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-33|rental_car:3-12",
+      "source_index": 45
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-43|restaurant:3-174",
+      "source_index": 49
+    },
+    {
+      "env_name": "travel33",
+      "task_id": "flight:3-183|apartment:3-268",
+      "source_index": 83
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-134|restaurant:4-2",
+      "source_index": 0
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-50|restaurant:4-150",
+      "source_index": 5
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-461|rental_car:4-17",
+      "source_index": 27
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-175|restaurant:4-76",
+      "source_index": 45
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-319|rental_car:4-81",
+      "source_index": 63
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "apartment:4-268|restaurant:4-95",
+      "source_index": 22
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "apartment:4-222|restaurant:4-56",
+      "source_index": 60
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-43|restaurant:4-38",
+      "source_index": 32
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "rental_car:4-30|restaurant:4-93",
+      "source_index": 52
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "apartment:4-48|restaurant:4-277",
+      "source_index": 16
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-142|rental_car:4-40",
+      "source_index": 35
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-461|restaurant:4-309",
+      "source_index": 19
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-479|hotel:4-34",
+      "source_index": 58
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-162|restaurant:4-119",
+      "source_index": 15
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-351|hotel:4-21",
+      "source_index": 34
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-156|restaurant:4-117",
+      "source_index": 48
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-123|rental_car:4-152",
+      "source_index": 54
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-148|rental_car:4-44",
+      "source_index": 28
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "apartment:4-182|rental_car:4-0",
+      "source_index": 6
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-301|apartment:4-278",
+      "source_index": 44
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-471|restaurant:4-270",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-256|restaurant:4-32",
+      "source_index": 25
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-18|apartment:4-23",
+      "source_index": 3
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "rental_car:4-123|restaurant:4-286",
+      "source_index": 29
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "apartment:4-169|restaurant:4-190",
+      "source_index": 59
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "flight:4-142|apartment:4-231",
+      "source_index": 57
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "rental_car:4-60|restaurant:4-80",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel44",
+      "task_id": "hotel:4-82|rental_car:4-82",
+      "source_index": 65
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-211|hotel:3-47|rental_car:2-12",
+      "source_index": 57
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-27|hotel:3-27|restaurant:3-158",
+      "source_index": 37
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-106|hotel:2-54|restaurant:3-106",
+      "source_index": 56
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "hotel:2-14|rental_car:3-40|restaurant:3-14",
+      "source_index": 49
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "hotel:3-152|rental_car:3-25|restaurant:2-51",
+      "source_index": 4
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-94|hotel:3-1|rental_car:3-132",
+      "source_index": 53
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "hotel:3-119|rental_car:3-17|restaurant:2-60",
+      "source_index": 15
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "hotel:3-61|rental_car:3-82|restaurant:2-91",
+      "source_index": 59
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-243|rental_car:2-26|restaurant:3-74",
+      "source_index": 45
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-99|rental_car:3-148|restaurant:3-121",
+      "source_index": 25
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-24|apartment:3-178|restaurant:3-280",
+      "source_index": 55
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-7|apartment:3-52|restaurant:3-237",
+      "source_index": 52
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-75|rental_car:2-42|restaurant:3-59",
+      "source_index": 9
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-58|apartment:3-109|rental_car:3-136",
+      "source_index": 51
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-63|apartment:3-123|rental_car:3-89",
+      "source_index": 17
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-29|hotel:3-127|restaurant:2-71",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "hotel:3-45|rental_car:2-47|restaurant:3-12",
+      "source_index": 14
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-209|apartment:2-45|restaurant:3-33",
+      "source_index": 24
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-65|rental_car:3-73|restaurant:3-156",
+      "source_index": 50
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-167|apartment:3-89|rental_car:2-71",
+      "source_index": 44
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-255|hotel:3-78|restaurant:2-96",
+      "source_index": 34
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:2-99|hotel:3-159|rental_car:3-109",
+      "source_index": 42
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-181|hotel:2-19|restaurant:3-241",
+      "source_index": 60
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-25|apartment:3-70|rental_car:2-48",
+      "source_index": 38
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-310|apartment:2-97|rental_car:3-136",
+      "source_index": 54
+    },
+    {
+      "env_name": "travel233",
+      "task_id": "flight:3-96|hotel:3-94|restaurant:2-38",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-219|rental_car:3-120|restaurant:3-160",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-128|hotel:3-39|rental_car:3-11",
+      "source_index": 0
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-202|apartment:3-11|rental_car:3-63",
+      "source_index": 16
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "apartment:3-28|rental_car:3-8|restaurant:3-323",
+      "source_index": 43
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "hotel:3-3|rental_car:3-84|restaurant:3-36",
+      "source_index": 13
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-211|rental_car:3-43|restaurant:3-201",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "hotel:3-105|rental_car:3-73|restaurant:3-304",
+      "source_index": 52
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-142|apartment:3-175|restaurant:3-113",
+      "source_index": 41
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-163|rental_car:3-136|restaurant:3-198",
+      "source_index": 1
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-243|rental_car:3-85|restaurant:3-308",
+      "source_index": 36
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "apartment:3-270|rental_car:3-92|restaurant:3-300",
+      "source_index": 21
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-161|hotel:3-81|rental_car:3-114",
+      "source_index": 4
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-243|apartment:3-172|rental_car:3-143",
+      "source_index": 32
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-204|apartment:3-199|restaurant:3-293",
+      "source_index": 49
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-273|apartment:3-140|rental_car:3-106",
+      "source_index": 39
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "hotel:3-63|rental_car:3-111|restaurant:3-250",
+      "source_index": 18
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-59|hotel:3-4|restaurant:3-243",
+      "source_index": 50
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-151|rental_car:3-138|restaurant:3-84",
+      "source_index": 10
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-167|apartment:3-179|restaurant:3-19",
+      "source_index": 48
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-4|hotel:3-13|restaurant:3-84",
+      "source_index": 51
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "apartment:3-286|rental_car:3-54|restaurant:3-281",
+      "source_index": 23
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "flight:3-101|rental_car:3-150|restaurant:3-285",
+      "source_index": 22
+    },
+    {
+      "env_name": "travel333",
+      "task_id": "apartment:3-142|rental_car:3-48|restaurant:3-133",
+      "source_index": 2
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "hotel:4-35|rental_car:3-150|restaurant:3-252",
+      "source_index": 33
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-98|apartment:4-38|restaurant:3-187",
+      "source_index": 16
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-36|apartment:4-281|rental_car:3-136",
+      "source_index": 46
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "apartment:3-93|rental_car:4-42|restaurant:3-59",
+      "source_index": 1
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "apartment:4-150|rental_car:3-37|restaurant:3-203",
+      "source_index": 36
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "apartment:3-19|rental_car:4-15|restaurant:3-136",
+      "source_index": 18
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-154|hotel:4-15|restaurant:3-107",
+      "source_index": 32
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "hotel:3-64|rental_car:3-48|restaurant:4-47",
+      "source_index": 26
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:4-60|hotel:3-146|restaurant:3-124",
+      "source_index": 14
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:4-421|hotel:3-89|rental_car:3-2",
+      "source_index": 41
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:4-66|apartment:3-154|restaurant:3-155",
+      "source_index": 23
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "hotel:4-43|rental_car:3-162|restaurant:3-217",
+      "source_index": 13
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "hotel:3-42|rental_car:4-113|restaurant:3-47",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:4-446|apartment:3-2|rental_car:3-108",
+      "source_index": 28
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "apartment:4-285|rental_car:3-42|restaurant:3-241",
+      "source_index": 29
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-185|apartment:3-3|rental_car:4-70",
+      "source_index": 9
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-228|apartment:3-250|restaurant:4-70",
+      "source_index": 0
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "hotel:3-73|rental_car:3-58|restaurant:4-275",
+      "source_index": 21
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-299|apartment:3-216|restaurant:4-149",
+      "source_index": 6
+    },
+    {
+      "env_name": "travel334",
+      "task_id": "flight:3-298|rental_car:3-111|restaurant:4-208",
+      "source_index": 2
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "apartment:4-51|rental_car:4-92|restaurant:4-136",
+      "source_index": 1
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "hotel:4-13|rental_car:4-56|restaurant:4-283",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "apartment:4-64|rental_car:4-16|restaurant:4-240",
+      "source_index": 26
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-192|rental_car:4-50|restaurant:4-194",
+      "source_index": 9
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-141|rental_car:4-116|restaurant:4-243",
+      "source_index": 27
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-287|apartment:4-180|restaurant:4-315",
+      "source_index": 3
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-131|hotel:4-72|restaurant:4-24",
+      "source_index": 37
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-67|apartment:4-241|rental_car:4-64",
+      "source_index": 11
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-248|apartment:4-131|rental_car:4-127",
+      "source_index": 25
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-53|hotel:4-47|restaurant:4-57",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-259|rental_car:4-85|restaurant:4-302",
+      "source_index": 17
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-298|hotel:4-49|rental_car:4-23",
+      "source_index": 35
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "apartment:4-259|rental_car:4-121|restaurant:4-297",
+      "source_index": 22
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "apartment:4-13|rental_car:4-65|restaurant:4-214",
+      "source_index": 7
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-416|hotel:4-71|rental_car:4-72",
+      "source_index": 10
+    },
+    {
+      "env_name": "travel444",
+      "task_id": "flight:4-471|apartment:4-61|restaurant:4-283",
+      "source_index": 31
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-82|hotel:2-47|rental_car:2-2|restaurant:2-111",
+      "source_index": 3
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-11|apartment:2-90|rental_car:2-8|restaurant:2-121",
+      "source_index": 7
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-28|hotel:2-42|rental_car:2-12|restaurant:2-18",
+      "source_index": 13
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-83|apartment:2-6|rental_car:2-44|restaurant:2-20",
+      "source_index": 4
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-61|apartment:2-68|rental_car:2-71|restaurant:2-53",
+      "source_index": 12
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-75|hotel:2-55|rental_car:2-55|restaurant:2-19",
+      "source_index": 8
+    },
+    {
+      "env_name": "travel2222",
+      "task_id": "flight:2-63|hotel:2-51|rental_car:2-60|restaurant:2-102",
+      "source_index": 11
+    }
+  ]
+}

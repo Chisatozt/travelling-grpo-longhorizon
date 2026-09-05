@@ -25,7 +25,7 @@ class TrainingConfigTests(unittest.TestCase):
 
     def test_grpo_defaults(self):
         config = yaml.safe_load(
-            (ROOT / "examples" / "sglang_multiturn" / "config" / "grpo_multiturn.yaml").read_text(
+            (ROOT / "configs" / "grpo" / "grpo_multiturn.yaml").read_text(
                 encoding="utf-8"
             )
         )
@@ -73,9 +73,9 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertEqual(config["trainer"]["save_freq"], 20)
 
     def test_grpo_launchers_expose_runtime_defaults(self):
-        stage = (ROOT / "examples" / "sglang_multiturn" / "run_grpo_stage.sh").read_text()
-        train = (ROOT / "examples" / "sglang_multiturn" / "train.sh").read_text()
-        native = (ROOT / "eval" / "native_validate.sh").read_text()
+        stage = (ROOT / "scripts" / "run_grpo_stage.sh").read_text()
+        train = (ROOT / "scripts" / "train_grpo.sh").read_text()
+        native = (ROOT / "scripts" / "evaluate_native.sh").read_text()
 
         self.assertIn('actor_rollout_ref.actor.optim.lr=1e-5', train)
         self.assertIn('actor_rollout_ref.model.lora_rank=32', train)

@@ -31,7 +31,7 @@ GRPO 或用于 Teacher 重采集。
 
 ```text
 238 条可解析旧 ShareGPT + DeepSeek Thinking Teacher cache（另有 362 个预留 Task）
-  -> sft/merge_travel_sft.py
+  -> travel_grpo.collection.merge_travel_sft
   -> canonical JSONL/Parquet + audit sidecar + manifest
   -> Qwen3.5 原生 chat template
   -> VERL MultiTurnSFTDataset（每条完整轨迹一个样本）
@@ -115,14 +115,14 @@ Reward/advantage/loss，也不进入 Actor observation；rank 0 原子写入，�
 不要在未验证版本上替换整个训练栈。先在服务主机运行：
 
 ```powershell
-python .\eval\check_qwen35_runtime.py --backend both --tokenizer Qwen/Qwen3.5-4B
+python -m travel_grpo.evaluation.check_qwen35_runtime --backend both --tokenizer Qwen/Qwen3.5-4B
 ```
 
 必须确认 Qwen3.5 tokenizer/template、`enable_thinking=true`、vLLM 的
 `qwen3_coder`/`qwen3` parser（或已验证的 SGLang 对应 parser）和工具 schema 完全
-一致。具体 SFT、Teacher 采集和合并命令见 `sft/README.md`；GRPO 启动脚本为
-`examples/sglang_multiturn/train.sh`。策略模型的 smoke20/final200 评测统一通过
-`eval/native_validate.sh`：它以 `trainer.val_only=true` 启动同一 native SGLang
+一致。具体 SFT、Teacher 采集和合并命令见 `docs/sft_pipeline.md`；GRPO 启动脚本为
+`scripts/train_grpo.sh`。策略模型的 smoke20/final200 评测统一通过
+`scripts/evaluate_native.sh`：它以 `trainer.val_only=true` 启动同一 native SGLang
 两阶段 rollout，按 task 进行 pass@3 和 early stop，禁止 validation retry，结果
 以 step 0 的公开聚合指标写入 SwanLab。该 pass@3 只属于独立的策略评测；正式
 GRPO 使用 `validation_pass_k=1` 的普通 validation，step 0 仅读取这份 baseline。

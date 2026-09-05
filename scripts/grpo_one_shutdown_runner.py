@@ -213,7 +213,7 @@ def main() -> int:
             report["failed_stage"] = "verify-merged-model"
             report["failure_reason"] = "; ".join(errors)
             ok = False
-    stage_script = str(root / "examples/sglang_multiturn/run_grpo_stage.sh")
+    stage_script = str(root / "scripts/run_grpo_stage.sh")
     if ok:
         ok = run_stage("grpo-preflight", ["bash", stage_script, "check"])
     if ok:

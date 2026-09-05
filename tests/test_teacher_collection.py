@@ -5,10 +5,10 @@ import unittest
 import json
 from pathlib import Path
 
-from eval.teacher_collection import TeacherCache, TeacherCacheError, make_provenance, sanitize_tracking_payload
-from sft.clean_travel_trajectories import clean_trajectory
-from sft.merge_travel_sft import merge_canonical_records
-from sft.travel_canonical import iter_source_records
+from travel_grpo.collection.teacher_collection import TeacherCache, TeacherCacheError, make_provenance, sanitize_tracking_payload
+from travel_grpo.collection.clean_travel_trajectories import clean_trajectory
+from travel_grpo.collection.merge_travel_sft import merge_canonical_records
+from travel_grpo.collection.travel_canonical import iter_source_records
 
 
 class TeacherCollectionTests(unittest.TestCase):

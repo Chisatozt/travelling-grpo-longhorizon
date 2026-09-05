@@ -90,7 +90,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-from sft.qwen35_mask import causal_target_mask
+from travel_grpo.training.sft.qwen35_mask import causal_target_mask
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input

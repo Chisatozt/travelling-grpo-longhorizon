@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sft.task_pools import (
+from travel_grpo.collection.task_pools import (
     OPAQUE_TASK_KEY_PREFIX,
     TaskPoolError,
     assert_task_pools_disjoint,
@@ -16,9 +16,9 @@ from sft.task_pools import (
     load_pool_manifest,
     pool_task_keys,
 )
-from sft.merge_travel_sft import prepare_canonical_inputs
-from sft.travel_canonical import canonical_hash, canonicalize_record
-from sft.travel_task_resolver import TravelTaskResolver
+from travel_grpo.collection.merge_travel_sft import prepare_canonical_inputs
+from travel_grpo.collection.travel_canonical import canonical_hash, canonicalize_record
+from travel_grpo.collection.travel_task_resolver import TravelTaskResolver
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +67,7 @@ class TaskPoolTests(unittest.TestCase):
         self.assertTrue(smoke <= validation)
 
         final200 = json.loads(
-            (ROOT / "eval" / "test_manifests" / "final200.json").read_text(encoding="utf-8")
+            (ROOT / "data" / "evaluation" / "test_manifests" / "final200.json").read_text(encoding="utf-8")
         )
         final_ids = {(item["env_name"] + "::" + item["task_id"]) for item in final200["records"]}
         self.assertEqual(validation, final_ids)
@@ -104,13 +104,13 @@ class TaskPoolTests(unittest.TestCase):
         first = self.manifest["quarantined_sft"][0]
         self.assertTrue(first["opaque_task_key"].startswith(OPAQUE_TASK_KEY_PREFIX))
         source = json.loads(
-            (ROOT / "sft" / "travel_sft_public.json").read_text(encoding="utf-8")
+            (ROOT / "data" / "sft" / "travel_sft_public.json").read_text(encoding="utf-8")
         )
         self.assertTrue(
             is_permanently_quarantined_opaque(
                 source[first["record_index"]],
                 source_index=first["record_index"],
-                source_path=ROOT / "sft" / "travel_sft_public.json",
+                source_path=ROOT / "data" / "sft" / "travel_sft_public.json",
             )
         )
         broken = json.loads(json.dumps(self.manifest))
@@ -122,7 +122,7 @@ class TaskPoolTests(unittest.TestCase):
 
     def test_canonical_merge_discards_all_six_opaque_rows(self):
         records, audits, stats = prepare_canonical_inputs(
-            [ROOT / "sft" / "travel_sft_public.json"],
+            [ROOT / "data" / "sft" / "travel_sft_public.json"],
             resolver=TravelTaskResolver(project_root=ROOT),
             require_think=False,
         )
@@ -170,11 +170,11 @@ class TaskPoolTests(unittest.TestCase):
             resolver = TravelTaskResolver(
                 project_root=root,
                 task_paths=[task_path],
-                explicit_map={"sft/travel_sft_public.json#97": "travel22::task-1"},
+                explicit_map={"data/sft/travel_sft_public.json#97": "travel22::task-1"},
             )
             task_id, _ = resolver.resolve(
                 record,
-                {"source_index": 97, "source_path": str(root / "sft" / "travel_sft_public.json")},
+                {"source_index": 97, "source_path": str(root / "data" / "sft" / "travel_sft_public.json")},
             )
             # The map key is intentionally portable and should resolve only
             # because the reviewed sidecar explicitly names the task.

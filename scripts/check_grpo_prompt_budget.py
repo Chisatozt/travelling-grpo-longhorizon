@@ -18,7 +18,7 @@ from verl.workers.rollout.schemas import AsyncRolloutRequest, AsyncRolloutReques
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "data/task_pools/travel_task_pools.json"
 DEFAULT_TOOL_CONFIG = (
-    ROOT / "examples/sglang_multiturn/config/tool_config/interact_tool_config.yaml"
+    ROOT / "configs/tools/interact_tool_config.yaml"
 )
 
 

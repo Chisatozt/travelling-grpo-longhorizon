@@ -73,12 +73,14 @@ extras_require = {
 
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
+root_packages = find_packages(where=".")
+source_packages = find_packages(where="src")
 
 setup(
     name="verl",
     version=__version__,
-    package_dir={"": "."},
-    packages=find_packages(where="."),
+    package_dir={"": ".", "travel_grpo": "src/travel_grpo"},
+    packages=[*root_packages, *source_packages],
     url="https://github.com/volcengine/verl",
     license="Apache 2.0",
     author="Bytedance - Seed - MLSys",

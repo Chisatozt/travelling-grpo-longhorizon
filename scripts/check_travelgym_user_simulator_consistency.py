@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "gyms" / "TravelGym"))
+sys.path.insert(0, str(ROOT / "environments" / "TravelGym"))
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_tasks() -> dict[str, dict[str, Any]]:
     tasks: dict[str, dict[str, Any]] = {}
-    for path in sorted((ROOT / "gyms" / "TravelGym" / "travelgym" / "data").glob("travelgym_data_*.json")):
+    for path in sorted((ROOT / "environments" / "TravelGym" / "travelgym" / "data").glob("travelgym_data_*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         tasks.update({str(key): value for key, value in payload.items()})
     return tasks
@@ -203,10 +203,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if "deepseek" not in config.model_name.casefold():
         raise RuntimeError("USER_MODEL_NAME must select the DeepSeek Teacher/User Simulator model")
 
-    audit = json.loads((ROOT / "sft" / "travel_sft_qwen35_merged.audit.json").read_text(encoding="utf-8"))
+    audit = json.loads((ROOT / "data" / "sft" / "travel_sft_qwen35_merged.audit.json").read_text(encoding="utf-8"))
     rows = [
         json.loads(line)
-        for line in (ROOT / "sft" / "travel_sft_qwen35_merged.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (ROOT / "data" / "sft" / "travel_sft_qwen35_merged.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     samples = select_samples(audit["records"], rows, load_tasks(), args.samples)

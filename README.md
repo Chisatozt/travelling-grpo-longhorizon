@@ -29,13 +29,20 @@ UserRL enables training language models to interact effectively with users acros
 
 ```
 UserRL/
-├── gyms/              # TravelGym environment
-├── verl/              # Core RL training framework
-├── examples/          # Training configurations and data preprocessing
-├── sft/               # Supervised fine-tuning pipeline
-├── eval/              # Comprehensive evaluation framework
-└── data/              # Training and validation datasets
+├── environments/TravelGym/  # canonical TravelGym environment
+├── verl/                    # Core RL training framework
+├── src/travel_grpo/         # canonical project-owned Python implementation
+├── configs/                 # project configuration
+├── scripts/                 # canonical user-facing entry points
+├── docs/                    # data, training, and evaluation documentation
+└── data/                    # training and validation datasets
 ```
+
+All project-owned Python implementation now has one physical home under
+`src/travel_grpo/`; evaluation and SFT artifacts live under `outputs/` and
+`data/`. The veRL runtime and its GRPO/SGLang integration remain in `verl/`.
+See [docs/repository_layout.md](docs/repository_layout.md) for the canonical
+layout.
 
 ### Key Features
 
@@ -69,7 +76,7 @@ UserRL/
 
 3. **Install TravelGym**
    ```bash
-   bash install_gyms.sh
+   python -m pip install -e environments/TravelGym
    ```
 
 ### Basic Training
@@ -98,8 +105,14 @@ UserRL/
 
 3. **Start Training**
    ```bash
-   bash ./examples/sglang_multiturn/train.sh
+   bash ./scripts/train_grpo.sh
    ```
+
+The equivalent organized entry point is:
+
+```bash
+bash ./scripts/train_grpo.sh
+```
 
 ## 🎮 TravelGym Dataset Variants
 
@@ -125,20 +138,20 @@ original 244-record file is never overwritten.  The task-pool manifest reserves
 tasks); six historical rows with unresolved task IDs are quarantined:
 
 ```powershell
-python .\sft\task_pools.py --sft-target-count 600 --output .\data\task_pools\travel_task_pools.json
+python -m travel_grpo.collection.task_pools --sft-target-count 600 --output .\data\task_pools\travel_task_pools.json
 # The six opaque historical rows are permanently isolated/discarded; no
 # reviewed task map is needed for the formal active-pool manifest.
-python .\eval\eval.py --model_name deepseek-v4-flash --sft-collection `
+python -m travel_grpo.evaluation.eval --model_name deepseek-v4-flash --sft-collection `
   --thinking enabled --include-think --require-think `
   --task-pool-manifest .\data\task_pools\travel_task_pools.json `
   --task-pool sft `
-  --max_turns 25 --save_name outputs/deepseek_teacher_sft
-python .\sft\merge_travel_sft.py `
-  --base .\sft\travel_sft_public.json `
-  --input .\eval\outputs\deepseek_teacher_sft_teacher_cache.json `
-  --output .\sft\travel_sft_canonical.jsonl `
+  --max_turns 25 --save_name deepseek_teacher_sft
+python -m travel_grpo.collection.merge_travel_sft `
+  --base .\data\sft\travel_sft_public.json `
+  --input .\outputs\evaluation\deepseek_teacher_sft_teacher_cache.json `
+  --output .\data\sft\travel_sft_canonical.jsonl `
   --tokenizer Qwen/Qwen3.5-4B --max-length 32768 `
-  --split-output-dir .\sft `
+  --split-output-dir .\data\sft `
   --task-pool-manifest .\data\task_pools\travel_task_pools.json
 ```
 
@@ -146,7 +159,7 @@ Then run the authoritative VERL LoRA config
 `verl/trainer/config/travel_qwen35_sft.yaml`.  Each complete trajectory is one
 sample; `assistant_train_mask` supervises only valid Assistant turns (including
 their CoT and tool call), and partial-correct rows carry weight 0.5.  See
-[sft/README.md](sft/README.md) for task-pool expansion, audit and validation details.
+[docs/sft_pipeline.md](docs/sft_pipeline.md) for task-pool expansion, audit and validation details.
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
@@ -195,12 +208,11 @@ trainer.milestones: [20, 40, 60, 80, 100]
 Evaluation across the TravelGym dataset variants:
 
 ```bash
-# See detailed instructions in eval/README.md
-cd eval/
-# Follow evaluation pipeline
+# See detailed instructions in docs/evaluation.md
+bash scripts/evaluate_native.sh smoke20
 ```
 
-The evaluator uses the fixed `eval/test_manifests/final200.json` set by
+The evaluator uses the fixed `data/evaluation/test_manifests/final200.json` set by
 default (the 20-task `smoke20.json` set is available for quick checks), rather
 than running all 471 composition-test tasks.  Task-level disjointness between
 SFT, GRPO, and Validation is enforced by
@@ -217,7 +229,7 @@ TravelGym training can use one or more GPUs:
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export N_GPUS_PER_NODE=8
 # The launcher passes trainer.nnodes=1 and derives the data/config paths.
-bash ./examples/sglang_multiturn/train.sh
+bash ./scripts/train_grpo.sh
 ```
 
 ### User Simulation Options
@@ -251,8 +263,8 @@ actor_rollout_ref.rollout.gpu_memory_utilization: 0.40
 
 TravelGym-specific changes must preserve the public contract documented in
 `docs/travel_public_protocol.md`. Regenerate numbered TravelGym parquet files
-with `examples/data_preprocess/travel_multiturn_w_tool.py`, merge the active
-variants with `examples/data_preprocess/merge_customize.py`, and update the
+with `python -m travel_grpo.collection.travel_multiturn_w_tool`, merge the active
+variants with `python -m travel_grpo.collection.merge_customize`, and update the
 offline contract tests before training.
 
 ## 📈 Monitoring and Logging
@@ -284,9 +296,9 @@ explicit compatibility override.
 
 We welcome contributions! Please see individual component READMEs:
 
-- [Gym Environments](gyms/README.md)
-- [SFT Pipeline](sft/README.md)  
-- [Evaluation Framework](eval/README.md)
+- [TravelGym Environment](environments/TravelGym/README.md)
+- [SFT Pipeline](docs/sft_pipeline.md)
+- [Evaluation Framework](docs/evaluation.md)
 - [TravelGym Training Chain](docs/travel_training_chain.md)
 
 ## 📝 Citation

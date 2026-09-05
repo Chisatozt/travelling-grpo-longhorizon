@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+SOURCE_ROOT = ROOT / "src"
+TRAVELGYM_SOURCE_ROOT = ROOT / "environments" / "TravelGym"
+for import_root in (SOURCE_ROOT, TRAVELGYM_SOURCE_ROOT, ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
-from sft.task_pools import assert_task_pools_disjoint
-from sft.travel_canonical import canonical_hash
+from travel_grpo.collection.task_pools import assert_task_pools_disjoint
+from travel_grpo.collection.travel_canonical import canonical_hash
 
 ENV_ORDER = (
     "travel22",
@@ -186,12 +189,12 @@ def main() -> None:
     parser.add_argument(
         "--sft-train",
         type=Path,
-        default=ROOT / "sft/travel_sft_qwen35_split/train.jsonl",
+        default=ROOT / "data/sft/travel_sft_qwen35_split/train.jsonl",
     )
     parser.add_argument(
         "--sft-audit",
         type=Path,
-        default=ROOT / "sft/travel_sft_qwen35_merged.audit.json",
+        default=ROOT / "data/sft/travel_sft_qwen35_merged.audit.json",
     )
     parser.add_argument(
         "--output",

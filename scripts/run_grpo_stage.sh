@@ -1,0 +1,242 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPOSITORY_ROOT/src:$REPOSITORY_ROOT/environments/TravelGym:$REPOSITORY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "$REPOSITORY_ROOT/.venv-grpo/bin/python" ]]; then
+        PYTHON_BIN="$REPOSITORY_ROOT/.venv-grpo/bin/python"
+    else
+        PYTHON_BIN="$(command -v python3)"
+    fi
+fi
+STAGE="${1:-check}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+MERGED_MODEL_PATH="${ACTOR_MODEL_PATH:-$REPOSITORY_ROOT/checkpoints/TravelGym/qwen35_4b_canonical_sft/merged_step_186}"
+OVERFIT_MANIFEST="$REPOSITORY_ROOT/data/task_pools/travel_grpo_overfit_pools.json"
+BASE_LAUNCHER="$REPOSITORY_ROOT/scripts/train_grpo.sh"
+
+require_merged_model() {
+    if [[ ! -d "$MERGED_MODEL_PATH" ]]; then
+        echo "Merged SFT model is missing: $MERGED_MODEL_PATH" >&2
+        echo "Run: python scripts/merge_sft_lora.py" >&2
+        exit 3
+    fi
+    local weight_file
+    weight_file="$(find "$MERGED_MODEL_PATH" -maxdepth 1 -type f \( -name 'model*.safetensors' -o -name 'pytorch_model*.bin' \) -print -quit)"
+    if [[ -z "$weight_file" ]]; then
+        echo "ACTOR_MODEL_PATH is not a complete merged model: $MERGED_MODEL_PATH" >&2
+        exit 3
+    fi
+}
+
+require_gpu() {
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+        echo "No usable NVIDIA GPU is attached; refusing to start GRPO." >&2
+        exit 4
+    fi
+}
+
+check_prompt_budget() {
+    OMP_NUM_THREADS=8 "$PYTHON_BIN" \
+        "$REPOSITORY_ROOT/scripts/check_grpo_prompt_budget.py" \
+        "$MERGED_MODEL_PATH" --pools grpo validation \
+        --max-prompt-length 1280
+}
+
+require_fresh_dir() {
+    local target="$1"
+    if [[ -e "$target" ]]; then
+        echo "Preflight output already exists; refusing to mix or overwrite runs: $target" >&2
+        exit 5
+    fi
+}
+
+run_overfit() {
+    local profile="$1"
+    local pool="$2"
+    local train_batch="$3"
+    local mini_batch="$4"
+    local experiment="$5"
+    local total_steps="$6"
+    local milestones="$7"
+    local save_freq="$8"
+    shift 8
+    # Keep the diagnostic run bounded; production retains the 31,616-token cap.
+    local overfit_max_response="${OVERFIT_MAX_RESPONSE_LENGTH:-24576}"
+    local overfit_max_model="${OVERFIT_MAX_MODEL_LEN:-32768}"
+    local overfit_max_prompt="${OVERFIT_MAX_PROMPT_LENGTH:-8192}"
+    local overfit_response_buffer="${OVERFIT_RESPONSE_TOKEN_BUFFER:-0}"
+    local overfit_actor_lr="${OVERFIT_ACTOR_LR:-1e-5}"
+    local checkpoint_dir="$REPOSITORY_ROOT/checkpoints/TravelGym/$experiment"
+    local artifact_dir="$REPOSITORY_ROOT/outputs/$experiment"
+    local monitor_kind=training
+    if [[ "${OVERFIT_DISABLE_VALIDATION:-false}" == "true" ]]; then
+        monitor_kind=training_no_validation
+    fi
+
+    require_merged_model
+    require_gpu
+    require_fresh_dir "$checkpoint_dir"
+    require_fresh_dir "$artifact_dir"
+
+    ACTOR_MODEL_PATH="$MERGED_MODEL_PATH" \
+    PYTHON_BIN="$PYTHON_BIN" \
+    RUN_UNTIL_STEP="$total_steps" \
+    GRPO_AUTO_SHUTDOWN="${GRPO_AUTO_SHUTDOWN:-1}" \
+    GRPO_MONITOR_KIND="$monitor_kind" \
+    GRPO_EXPECTED_STEP="$total_steps" \
+    GRPO_CHECKPOINT_ROOT="$checkpoint_dir" \
+    GRPO_ARTIFACT_ROOT="$artifact_dir" \
+    GRPO_TRAINING_LOG="$artifact_dir/training.log" \
+    USE_TRAIN_FILES_FOR_VAL=true \
+    bash "$BASE_LAUNCHER" \
+        trainer.experiment_profile="$profile" \
+        trainer.experiment_name="$experiment" \
+        trainer.default_local_dir="$checkpoint_dir" \
+        trainer.resume_mode=disable \
+        trainer.total_training_steps="$total_steps" \
+        trainer.run_until_step="$total_steps" \
+        trainer.milestones="$milestones" \
+        trainer.save_freq="$save_freq" \
+        trainer.test_freq="$save_freq" \
+        trainer.total_epochs="$total_steps" \
+        trainer.val_before_train=false \
+        trainer.disable_validation="${OVERFIT_DISABLE_VALIDATION:-false}" \
+        trainer.wait_for_selected_grpo_checkpoint=false \
+        trainer.log_val_generations=8 \
+        trainer.rollout_data_dir="$artifact_dir/rollouts" \
+        trainer.validation_data_dir="$artifact_dir/validation" \
+        algorithm.hard_case_pool.path="$checkpoint_dir/hard_case_pool.json" \
+        data.shuffle=false \
+        data.validation_shuffle=false \
+        data.train_batch_size="$train_batch" \
+        data.max_response_length="$overfit_max_response" \
+        data.max_prompt_length="$overfit_max_prompt" \
+        actor_rollout_ref.rollout.max_model_len="$overfit_max_model" \
+        actor_rollout_ref.rollout.multi_turn.response_token_buffer="$overfit_response_buffer" \
+        actor_rollout_ref.actor.optim.lr="$overfit_actor_lr" \
+        actor_rollout_ref.actor.ppo_mini_batch_size="$mini_batch" \
+        data.task_pool_manifest="$OVERFIT_MANIFEST" \
+        data.task_pool_name="$pool" \
+        data.task_pool_train_name="$pool" \
+        data.task_pool_val_name="$pool" \
+        data.task_pool_smoke_name="$pool" \
+        "$@"
+}
+
+case "$STAGE" in
+    check)
+        "$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/prepare_grpo_overfit_pools.py" --check
+        OMP_NUM_THREADS=8 "$PYTHON_BIN" "$REPOSITORY_ROOT/scripts/check_grpo_runtime.py" "$MERGED_MODEL_PATH"
+        check_prompt_budget
+        if [[ -d "$MERGED_MODEL_PATH" ]]; then
+            require_merged_model
+            echo "Merged model: OK ($MERGED_MODEL_PATH)"
+        else
+            echo "Merged model: MISSING ($MERGED_MODEL_PATH)"
+        fi
+        if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+            echo "GPU: available"
+        else
+            echo "GPU: unavailable"
+        fi
+        ;;
+    overfit-one)
+        run_overfit overfit_one grpo_overfit_one 1 1 travelgym_grpo_overfit_1task_sft186 10 '[10]' 10 "$@"
+        ;;
+    overfit-four)
+        if [[ "${CONFIRM_OVERFIT_FOUR:-}" != "YES" ]]; then
+            echo "The 4-task GRPO diagnostic is intentionally paused." >&2
+            echo "After reviewing the 1-task run, set CONFIRM_OVERFIT_FOUR=YES explicitly." >&2
+            exit 7
+        fi
+        OVERFIT_DISABLE_VALIDATION=true \
+        run_overfit overfit_four grpo_overfit_four 4 2 "${OVERFIT_FOUR_EXPERIMENT:-travelgym_grpo_overfit_4tasks_sft186_rewardv2}" 20 '[10,20]' 10 "$@"
+        ;;
+    production)
+        if [[ "${CONFIRM_PRODUCTION_GRPO:-}" != "YES" ]]; then
+            echo "Production GRPO is intentionally paused." >&2
+            echo "After reviewing both overfit runs, set CONFIRM_PRODUCTION_GRPO=YES explicitly." >&2
+            exit 6
+        fi
+        require_merged_model
+        require_gpu
+        check_prompt_budget
+        experiment="${PRODUCTION_EXPERIMENT_NAME:-travelgym_grpo_production_deepseek_user_sft186_100_retry1}"
+        production_resume_mode="${PRODUCTION_RESUME_MODE:-disable}"
+        production_val_before_train="${PRODUCTION_VAL_BEFORE_TRAIN:-false}"
+        case "$production_val_before_train" in
+            true|false)
+                ;;
+            *)
+                echo "PRODUCTION_VAL_BEFORE_TRAIN must be true or false." >&2
+                exit 8
+                ;;
+        esac
+        checkpoint_dir="$REPOSITORY_ROOT/checkpoints/TravelGym/$experiment"
+        artifact_dir="$REPOSITORY_ROOT/outputs/$experiment"
+        case "$production_resume_mode" in
+            disable)
+                require_fresh_dir "$checkpoint_dir"
+                require_fresh_dir "$artifact_dir"
+                ;;
+            auto)
+                if [[ ! -d "$checkpoint_dir" || ! -d "$artifact_dir" ]]; then
+                    echo "PRODUCTION_RESUME_MODE=auto requires existing checkpoint and artifact directories." >&2
+                    exit 8
+                fi
+                ;;
+            *)
+                echo "PRODUCTION_RESUME_MODE must be disable or auto." >&2
+                exit 8
+                ;;
+        esac
+        ACTOR_MODEL_PATH="$MERGED_MODEL_PATH" \
+        PYTHON_BIN="$PYTHON_BIN" \
+        RUN_UNTIL_STEP="${RUN_UNTIL_STEP:-20}" \
+        USE_TRAIN_FILES_FOR_VAL=false \
+        TRAVELGYM_USER_SIMULATOR=deepseek_api \
+        TRAVELGYM_USER_TIMEOUT="${TRAVELGYM_USER_TIMEOUT:-45}" \
+        TRAVELGYM_STEP_TIMEOUT="${TRAVELGYM_STEP_TIMEOUT:-300}" \
+        TRAVELGYM_USER_JUDGE_MAX_TOKENS="${TRAVELGYM_USER_JUDGE_MAX_TOKENS:-128}" \
+        TRAVELGYM_USER_RESPONSE_MAX_TOKENS="${TRAVELGYM_USER_RESPONSE_MAX_TOKENS:-2048}" \
+        MODEL_MAX_ATTEMPTS="${MODEL_MAX_ATTEMPTS:-3}" \
+        TRAVELGYM_USER_REQUEST_CONCURRENCY="${TRAVELGYM_USER_REQUEST_CONCURRENCY:-8}" \
+        TRAVELGYM_USER_CACHE_PATH="$artifact_dir/user_simulator/responses.sqlite3" \
+        TRAVELGYM_USER_API_LOG_PATH="$artifact_dir/user_simulator/api.events.jsonl" \
+        GRPO_AUTO_SHUTDOWN="${GRPO_AUTO_SHUTDOWN:-1}" \
+        GRPO_MONITOR_KIND=training \
+        GRPO_EXPECTED_STEP="${RUN_UNTIL_STEP:-20}" \
+        GRPO_CHECKPOINT_ROOT="$checkpoint_dir" \
+        GRPO_ARTIFACT_ROOT="$artifact_dir" \
+        GRPO_TRAINING_LOG="$artifact_dir/training.log" \
+        OMP_NUM_THREADS=8 \
+        bash "$BASE_LAUNCHER" \
+            trainer.experiment_profile=production \
+            trainer.experiment_name="$experiment" \
+            trainer.default_local_dir="$checkpoint_dir" \
+            trainer.resume_mode="$production_resume_mode" \
+            trainer.save_freq="${PRODUCTION_SAVE_FREQ:-5}" \
+            trainer.wait_for_selected_grpo_checkpoint=false \
+            trainer.rollout_data_dir="$artifact_dir/rollouts" \
+            trainer.validation_data_dir="$artifact_dir/validation" \
+            algorithm.hard_case_pool.path="$checkpoint_dir/hard_case_pool.json" \
+            "$@" \
+            actor_rollout_ref.model.path="$MERGED_MODEL_PATH" \
+            trainer.run_until_step="${RUN_UNTIL_STEP:-20}" \
+            trainer.val_before_train="$production_val_before_train" \
+            trainer.initial_validation_smoke=true \
+            trainer.validation_pass_k=1 \
+            trainer.validation_task_level_early_stop=true \
+            trainer.validation_retry_attempts=2
+        ;;
+    *)
+        echo "Usage: $0 {check|overfit-one|overfit-four|production} [Hydra overrides...]" >&2
+        exit 2
+        ;;
+esac

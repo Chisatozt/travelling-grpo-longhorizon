@@ -48,13 +48,13 @@ launcher refuses an adapter-only directory.
 Check readiness without starting training:
 
 ```bash
-examples/sglang_multiturn/run_grpo_stage.sh check
+scripts/run_grpo_stage.sh check
 ```
 
 With a GPU attached, run the one-task diagnostic:
 
 ```bash
-examples/sglang_multiturn/run_grpo_stage.sh overfit-one
+scripts/run_grpo_stage.sh overfit-one
 ```
 
 Review SwanLab and the rollout dumps, then start the independent four-task,
@@ -62,7 +62,7 @@ Review SwanLab and the rollout dumps, then start the independent four-task,
 
 ```bash
 CONFIRM_OVERFIT_FOUR=YES \
-  examples/sglang_multiturn/run_grpo_stage.sh overfit-four
+  scripts/run_grpo_stage.sh overfit-four
 ```
 
 The four-task run saves and validates at steps 10 and 20. The one-task run
@@ -73,7 +73,7 @@ runs have been reviewed should it be explicitly unlocked:
 
 ```bash
 CONFIRM_PRODUCTION_GRPO=YES \
-  examples/sglang_multiturn/run_grpo_stage.sh production
+  scripts/run_grpo_stage.sh production
 ```
 
 The overfit runs use their training tasks for baseline/final validation on

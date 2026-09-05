@@ -30,7 +30,7 @@ from transformers import PreTrainedTokenizer
 
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_local_path_from_hdfs
-from sft.qwen35_mask import exact_assistant_span_masks, exact_assistant_token_mask, native_template_ids
+from travel_grpo.training.sft.qwen35_mask import exact_assistant_span_masks, exact_assistant_token_mask, native_template_ids
 
 
 def convert_nested_value_to_list_recursive(data_item):

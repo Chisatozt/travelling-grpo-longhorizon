@@ -8,7 +8,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "gyms" / "TravelGym"))
+sys.path.insert(0, str(ROOT / "environments" / "TravelGym"))
 
 import travelgym  # noqa: E402
 
@@ -204,4 +204,3 @@ def test_external_invalid_call_produces_penalty_event_and_consumes_budget(tmp_pa
     report = env.get_reward_report()
     assert report["invalid_call_count"] == 1
     assert report["max_steps_reached"] == 1.0
-

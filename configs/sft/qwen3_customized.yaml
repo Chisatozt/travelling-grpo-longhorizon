@@ -1,0 +1,43 @@
+### DEPRECATED COMPATIBILITY CONFIG
+# This LLaMA-Factory file is retained only to render/regress the historical
+# ShareGPT format.  It cannot consume canonical assistant_train_mask or the
+# weighted complete-trajectory loss.  Use
+# verl/trainer/config/travel_qwen35_sft.yaml for the authoritative Qwen3.5 SFT.
+
+### model
+model_name_or_path: Qwen/Qwen3.5-4B # change to a local checkpoint if needed
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+# Supply a valid external DeepSpeed config when using this legacy renderer.
+
+### dataset
+dataset: travel_sft_public
+template: qwen3
+cutoff_len: 32768
+train_on_prompt: false
+mask_history: true
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### output
+output_dir: saves/saved_folder_name # change to your own folder name
+logging_steps: 5
+save_strategy: epoch
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000

@@ -10,15 +10,15 @@ from pathlib import Path
 
 import yaml
 
-from sft.clean_travel_trajectories import clean_trajectory, is_sft_eligible
-from sft.qwen35_mask import (
+from travel_grpo.collection.clean_travel_trajectories import clean_trajectory, is_sft_eligible
+from travel_grpo.training.sft.qwen35_mask import (
     assert_template_equivalence,
     causal_target_mask,
     exact_assistant_token_mask,
     native_template_ids,
     template_messages,
 )
-from sft.travel_canonical import canonical_hash, canonical_tools_schema, canonicalize_record, validate_canonical
+from travel_grpo.collection.travel_canonical import canonical_hash, canonical_tools_schema, canonicalize_record, validate_canonical
 from verl.tools.travel_tool_adapter import format_environment_action, normalize_tool_call, sanitize_public_feedback
 from verl.trainer.ppo.hard_case_pool import HardCasePool, compose_task_key
 
@@ -414,8 +414,8 @@ class CanonicalPipelineTests(unittest.TestCase):
 
     def test_tool_schema_is_shared_with_eval_and_sglang_config(self):
         expected = canonical_tools_schema()[0]
-        eval_schema = yaml.safe_load(Path("eval/schema/interact_tool.yaml").read_text(encoding="utf-8"))["tool_schema"]
-        sglang_schema = yaml.safe_load(Path("examples/sglang_multiturn/config/tool_config/interact_tool_config.yaml").read_text(encoding="utf-8"))["tools"][0]["tool_schema"]
+        eval_schema = yaml.safe_load(Path("configs/tools/interact_tool_schema.yaml").read_text(encoding="utf-8"))["tool_schema"]
+        sglang_schema = yaml.safe_load(Path("configs/tools/interact_tool_config.yaml").read_text(encoding="utf-8"))["tools"][0]["tool_schema"]
         self.assertEqual(eval_schema, expected)
         self.assertEqual(sglang_schema, expected)
 

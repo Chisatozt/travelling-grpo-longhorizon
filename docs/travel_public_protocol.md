@@ -49,7 +49,7 @@ terminal = clip(raw / 3.70, -1, 1)
 由 agent 问题实际引出的偏好，模拟器主动透露仅作为诊断。`total_penalty` 在终局
 累计非法调用与错误答案、宽限后的冗余 Action、未回答覆盖缺口、零答案以及
 `max_steps` 惩罚；精确重复询问不享受无收益宽限。剩余步数仅够完成未回答链时，
-控制器拒绝继续 Action。具体系数固定在 `eval/travel_manifest.json`。无效基础设施
+控制器拒绝继续 Action。具体系数固定在 `data/evaluation/travel_manifest.json`。无效基础设施
 Reward 的 rollout 标记 `reward_valid=false`，训练器隔离。
 
 ## State machine

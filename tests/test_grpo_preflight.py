@@ -4,8 +4,8 @@ import json
 import unittest
 from pathlib import Path
 
-from sft.task_pools import assert_task_pools_disjoint
-from sft.travel_canonical import canonical_hash
+from travel_grpo.collection.task_pools import assert_task_pools_disjoint
+from travel_grpo.collection.travel_canonical import canonical_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +53,7 @@ class GRPOPreflightPoolTests(unittest.TestCase):
 
     def test_selected_tasks_are_in_actual_sft_train_split(self):
         audits = json.loads(
-            (ROOT / "sft/travel_sft_qwen35_merged.audit.json").read_text(encoding="utf-8")
+            (ROOT / "data/sft/travel_sft_qwen35_merged.audit.json").read_text(encoding="utf-8")
         )["records"]
         audit_by_hash = {
             record["canonical_hash_after"]: record
@@ -61,7 +61,7 @@ class GRPOPreflightPoolTests(unittest.TestCase):
             if record.get("canonical_hash_after")
         }
         train_task_keys = set()
-        for line in (ROOT / "sft/travel_sft_qwen35_split/train.jsonl").read_text(encoding="utf-8").splitlines():
+        for line in (ROOT / "data/sft/travel_sft_qwen35_split/train.jsonl").read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)

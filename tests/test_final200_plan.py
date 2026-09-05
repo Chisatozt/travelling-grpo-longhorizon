@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from eval.final200 import Final200Error, build_final200_plan, evaluate_final200
+from travel_grpo.evaluation.final200 import Final200Error, build_final200_plan, evaluate_final200
 
 
 class Final200PlanTests(unittest.TestCase):

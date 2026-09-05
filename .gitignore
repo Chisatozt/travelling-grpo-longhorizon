@@ -126,6 +126,6 @@ outputs
 .archive/
 
 # Local SFT pipeline smoke/QA artifacts
-sft/_tmp*
-sft/_check*
-sft/qa_*
+data/sft/_tmp*
+data/sft/_check*
+data/sft/qa_*
