@@ -1,31 +1,18 @@
-# TravelGym task pools
+# data/task_pools
 
-`travel_task_pools.json` is the checked-in `travelgym-task-pools-v2`
-deterministic partition used by the training/evaluation code.  A task key is
-`env_name::task_id`.
+这里是项目的任务身份总表，负责把同一批 TravelGym task 分配给 SFT、GRPO、validation 和诊断阶段。它解决的是 task-level 数据泄漏问题，不只是给 Parquet 添加标签。
 
-| Pool | Source | Use |
-| --- | --- | --- |
-| `sft` | 238 resolvable historical tasks + 362 deterministic train-task reservations | historical SFT and DeepSeek Teacher collection |
-| `sft_smoke` | stratified 20-task subset of `sft` | paid DeepSeek Teacher smoke collection |
-| `grpo` | train tasks not in `sft` | Actor rollout during GRPO |
-| `validation` | fixed 200-task test selection | final validation |
-| `validation_smoke` | fixed 20-task subset of `validation` | quick validation |
+| 文件 | 用途 |
+| --- | --- |
+| travel_task_pools.json | 当前正式 SFT、GRPO、validation 和 smoke 分区 |
+| travel_grpo_overfit_pools.json | overfit-one/overfit-four 诊断子池 |
+| sft_task_alignment_candidates.json | 历史任务对齐和 quarantine 审计 |
 
-The checked-in formal manifest reserves 600 resolved train tasks for SFT.  The expansion
-reservations are marked `role=teacher_expansion`; they are task reservations,
-not trajectories, so a task may later receive multiple Teacher trajectories.
+活动身份统一为 env_name::task_id。当前 manifest 的选择 seed 为 20260801；重新构建后必须重新检查活动池互斥、Final-200 一致性和 opaque task quarantine。
 
-Regenerate the deterministic partition with:
+~~~bash
+python -m travel_grpo.collection.task_pools --help
+python scripts/prepare_grpo_overfit_pools.py --help
+~~~
 
-```powershell
-python -m travel_grpo.collection.task_pools `
-  --sft-target-count 600 `
-  --output .\data\task_pools\travel_task_pools.json
-```
-
-Six historical rows whose task IDs cannot be recovered unambiguously are
-explicitly listed under `quarantined_sft` and permanently excluded from every
-active pool, including canonical SFT merge and Teacher collection.  The checked-in
-manifest is strict for active task identities; `sft_task_alignment_candidates.json`
-is retained as audit evidence only.  No ID is inferred or reintroduced by the code.
+流程说明见 [数据采集](../../docs/data_collection.md)、[训练链路](../../docs/travel_training_chain.md) 和 [评测数据集](../../docs/evaluation_dataset.md)。

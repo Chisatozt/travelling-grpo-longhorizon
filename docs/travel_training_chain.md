@@ -1,128 +1,72 @@
-# TravelGym 训练链路
+# TravelGym 训练链路与数据隔离
 
-当前项目只实现 TravelGym 的公开交互协议：
+## 端到端数据血缘
 
-```text
-Search 完整候选 -> Action 自然语言证据 -> Actor 隐式比较 -> Answer 可见 ID
-```
+~~~text
+data/task_pools/travel_task_pools.json
+  -> Teacher/API collection
+  -> public transcript replay + canonicalization
+  -> SFT classification/audit
+  -> Qwen native chat template + assistant_train_mask
+  -> FSDP LoRA SFT
+  -> merged SFT model
+  -> veRL GRPO trainer
+  -> SGLang rollout + InteractTool
+  -> TravelGym terminal Reward
+  -> GRPO advantage/update
+  -> native smoke20/final200 evaluation
+~~~
 
-Action 不会修改 `all_options`，环境没有 CandidateFilter、filtered_candidates
-或候选匹配 F1。环境状态机只维护并公开：
-`current_aspect`、`searched_aspects`、`visible_option_ids`、
-`action_count_by_aspect`、`answered_aspects` 和公开对话历史；偏好命中、正确/最佳
-ID 与 Reward 永远留在 User Simulator/Reward ledger。
+每条链路只使用一个物理源码位置；数据和 checkpoint 是显式输入，不通过旧目录或隐式
+symlink 寻址。
 
-## 训练数据链
+## 任务隔离
 
-### 任务互斥分区
+身份键是 env_name::task_id：
 
-`data/task_pools/travel_task_pools.json` 是任务划分的唯一来源，身份键为
-`env_name::task_id`：
+~~~text
+SFT        = 238 historical + 362 reserved Teacher expansion task
+GRPO       = train task - SFT identities
+Validation = fixed 200 test task
+Smoke20    = fixed 20-task subset of Validation
+~~~
 
-```text
-SFT-Task-Pool       = 238 个可解析历史 Task + 362 个确定性 Teacher 扩展 Task
-GRPO-Task-Pool      = train split 中排除 SFT 身份后的任务
-Validation-Task-Pool= test split 的 final200；smoke20 是其子集
-```
-
-构建器会校验三者两两交集为空，并且固定 `selection_seed`。6 条无法解析的历史
-SFT 记录单独写入 `quarantined_sft`，不属于任何活动池，也不会被猜测分配给
-GRPO 或用于 Teacher 重采集。
-
-```text
-238 条可解析旧 ShareGPT + DeepSeek Thinking Teacher cache（另有 362 个预留 Task）
-  -> travel_grpo.collection.merge_travel_sft
-  -> canonical JSONL/Parquet + audit sidecar + manifest
-  -> Qwen3.5 原生 chat template
-  -> VERL MultiTurnSFTDataset（每条完整轨迹一个样本）
-  -> assistant_train_mask 的 token-level loss
-  -> LoRA SFT
-  -> SGLang/vLLM Qwen3.5 rollout
-  -> 统一 tool adapter -> TravelGym
-  -> terminal-only Reward -> GRPO advantage/update
-```
-
-GRPO 的 parquet loader 会在 tokenisation 前按 `task_pool_name=grpo` 过滤；验证
-loader 使用同一清单的 `validation`。因此即使误传聚合 parquet，也不会把 SFT
-或 Validation task 混入 GRPO。训练配置开启 `task_pool_require_strict=true`。
-6 条 opaque quarantine 记录虽然保留在私有审计清单中，但已永久隔离/弃用；活动池
-清单直接满足 `strict_task_identity=true`，不需要 reviewed map。
+任务池构建器会验证 active pool 互斥、source row 与 task ID 一致、selection seed
+固定。6 条无法恢复的历史记录写入 quarantine，永不自动猜测。Parquet loader 在
+tokenization/rollout 之前按 pool 过滤，因此聚合 Parquet 不能绕过任务隔离。
 
 ## Canonical 和清洗
 
-canonical schema 是 `travelgym-canonical-v1`：标准 system/user/assistant/tool、
-独立 `reasoning_content`、结构化 `tool_calls`、内部 dict arguments、匹配
-`tool_call_id`、统一 OpenAI function schema，以及与消息等长的
-`assistant_train_mask`。Qwen template 的输入 token 由 tokenizer 原生渲染；legacy
-`<think>/<tool_call>` 只在导入和回归 renderer 使用。
+canonical schema 是 travelgym-canonical-v1：
 
-清洗器对 malformed JSON、截断、observation 错位、无法修复的公开拒绝、环境/API
-故障和错误终局 Answer 从 offending Assistant Turn 开始删除整个后缀。带明确公开
-反馈且之后有合法修复的错误保留为上下文（mask=0），修复 Turn mask=1。环境已经
-接受但隐藏语义错误的非终局 Answer 同样保留上下文而不监督；终局错误 Answer
-截断。清洗后重新计算 `correct_completion` 和 `completion_success`，按以下优先级
-分类：
+- 标准 system/user/assistant/tool messages；
+- 独立 reasoning_content；
+- 结构化 tool_calls；
+- 内部 dict arguments；
+- assistant_train_mask 与 messages 对齐；
+- sample_weight 记录 strict/recoverable/partial 的监督权重。
 
-1. `infrastructure_invalid`；
-2. 成功且保留修复错误：`recoverable_correct`；
-3. 成功且无保留错误：`strict_gold`；
-4. 未成功但有正确 aspect：`partial_correct`；
-5. `correct_completion=0`：`totally_wrong`。
+cleaner 从公开拒绝和 tool/observation 对齐信息回放状态机：
 
-即使原轨迹曾发生 fatal，只要截断后成功且没有保留错误，仍为 `strict_gold`。
-SFT 权重为 strict/recoverable=1，partial=0.5；totally_wrong、基础设施和超长
-样本不进入 SFT。
+- 可明确修复的 action-before-search、answer-before-search、cross-aspect、repeated
+  search、invisible ID、duplicate answer、vague action 会保留为 mask=0 上下文；
+- malformed JSON、缺少 tool call、think/tool 截断、tool_call_id mismatch、observation
+  错位、环境失败和无法修复的 terminal error 会截断后缀；
+- 清洗后重新计算 completion/coverage/合法链指标；
+- wrong/infrastructure/overlength 不进入 SFT。
 
-## GRPO 和 Reward
+## SFT 与 GRPO 边界
 
-TravelGym 的每个环境交互 step 返回 0；终局由私有 ledger 一次性计算
-`travelgym-terminal-v2`：
+SFT 训练只优化 assistant 目标 token，user/tool observation 是上下文。训练使用
+verl.trainer.fsdp_sft_trainer，不依赖 SGLang。
 
-```text
-raw = 3.00 * correct_completion
-    + 0.30 * (best_answers / requested_aspects)
-    + 0.20 * (legal_answer_chains / requested_aspects)
-    + 0.15 * agent_hidden_preference_hit_rate
-    + 0.05 * efficiency
-    - total_penalty
-terminal = clip(raw / 3.70, -1, 1)
-```
+GRPO 从合并后的 SFT 模型开始。veRL 负责 optimizer、FSDP、Ray、group advantage 和
+checkpoint；SGLang 负责当前策略的多轮 rollout；InteractTool 保持 TravelGym
+实例；terminal Reward 只通过 trainer metadata 回传。SGLang 反馈中的 observation
+不会包含 private Reward。
 
-`total_penalty` 包含：非法调用 0.05/次与错误答案 0.10/次（合计上限 1.0）；
-每个 aspect 首次无收益询问宽限后，前三次冗余各 0.05、之后各 0.10（上限 0.60），
-完全相同的重复询问不享受宽限；未回答覆盖缺口按 `1-answer_coverage` 扣除，
-零答案额外扣 0.50，达到 `max_steps` 额外扣 0.75。模拟器主动透露偏好只计诊断，
-不计 agent elicitation 奖励。剩余步数仅够完成未回答链时，环境会拒绝新的 Action。
+## Validation 边界
 
-GRPO 的 rollout group 使用终局标量；当前配置启用有界动态重采样，
-每次 update 最多生成 3 个 batch。`numerical_epsilon=1e-6` 只判定数值相等，
-`min_reward_spread=0.005` 则过滤会被标准差归一化放大的微小 shaping 差异。
-Hard Case Pool 仍不会触发重采样、batch 注入或训练。TurnCredit 默认在终局
-GRPO advantage 确定后按守恒规则进入 `train`；如需关闭，设置
-`algorithm.turn_credit.stage=off`。
-
-## Hard Case Pool
-
-`algorithm.hard_case_pool` 是 trainer-side、append-only 的被动观察器。某 task 在
-连续 3 个独立完整 group 中，每个 group 的全部 n 条 rollout 都满足
-`reward_valid=true` 且 `correct_completion=0` 时，记录 task ID、来源、
-streak、step、group size、Reward 版本和审计信息。它不重采样、不注入 batch、不改
-Reward/advantage/loss，也不进入 Actor observation；rank 0 原子写入，并随 checkpoint
-保存 `hard_case_pool_state.json`，目前只供后续人工校验。
-
-## 运行前检查
-
-不要在未验证版本上替换整个训练栈。先在服务主机运行：
-
-```powershell
-python -m travel_grpo.evaluation.check_qwen35_runtime --backend both --tokenizer Qwen/Qwen3.5-4B
-```
-
-必须确认 Qwen3.5 tokenizer/template、`enable_thinking=true`、vLLM 的
-`qwen3_coder`/`qwen3` parser（或已验证的 SGLang 对应 parser）和工具 schema 完全
-一致。具体 SFT、Teacher 采集和合并命令见 `docs/sft_pipeline.md`；GRPO 启动脚本为
-`scripts/train_grpo.sh`。策略模型的 smoke20/final200 评测统一通过
-`scripts/evaluate_native.sh`：它以 `trainer.val_only=true` 启动同一 native SGLang
-两阶段 rollout，按 task 进行 pass@3 和 early stop，禁止 validation retry，结果
-以 step 0 的公开聚合指标写入 SwanLab。该 pass@3 只属于独立的策略评测；正式
-GRPO 使用 `validation_pass_k=1` 的普通 validation，step 0 仅读取这份 baseline。
+GRPO 内置 validation 是训练健康检查，默认一题一次；native evaluate_native.sh
+的 pass@3 是独立的策略评测。Final-200 不能反向影响 task pool、prompt、checkpoint
+或 Reward。所有正式比较都保留 invalid/not-judged 任务在分母和审计中。

@@ -1,165 +1,107 @@
-# TravelGym canonical SFT 数据管线
+# Canonical SFT 管线（实现约定）
 
-SFT 的公开协议固定为：
+本文是 [SFT 操作指南](sft.md) 的实现补充，说明清洗器、数据格式和 token mask 的
+不可变约定。
 
-```text
-Search 获取当前 aspect 的完整候选
-  -> Action 获取用户自然语言证据（不改变候选列表）
-  -> Actor 在上下文中隐式比较
-  -> Answer 提交 Search 中可见的一个 option ID
-```
+## 输入和输出
 
-候选不会由环境过滤或缩小；`preference_id`、`correct_ids`、`best_id`、Reward
-和清洗诊断只在 User Simulator、Reward ledger 或 audit sidecar 中存在，不会
-进入 canonical `messages`、tool observation 或 Actor observation。
+入口模块：
 
-## 1. Teacher 采集
+~~~text
+travel_grpo.collection.prepare_travel_sft
+travel_grpo.collection.merge_travel_sft
+travel_grpo.collection.clean_travel_trajectories
+travel_grpo.collection.travel_canonical
+travel_grpo.training.sft.sft_split
+travel_grpo.training.sft.qwen35_mask
+travel_grpo.training.sft.validate_travel_canonical
+~~~
 
-先生成一次互斥任务清单。预览阶段将历史语料中可解析的 238 个 Task 加上 362
-个确定性扩展 Task，组成 600-task 的 `sft` pool；GRPO 使用其余 train task，
-Validation 使用固定 test task：
+推荐用 module CLI：
 
-```powershell
-python -m travel_grpo.collection.task_pools `
-  --sft-target-count 600 `
-  --output .\data\task_pools\travel_task_pools.json
-```
+~~~bash
+python -m travel_grpo.collection.prepare_travel_sft --help
+python -m travel_grpo.collection.merge_travel_sft --help
+python -m travel_grpo.training.sft.sft_split --help
+~~~
 
-当前历史语料中有 6 条无法仅凭公开内容唯一对齐的记录。它们被列入
-`quarantined_sft`，永久隔离/弃用，不属于任何活动池，也不会被 Teacher
-重新采集或用于 SFT。正式清单对活动池直接标记
-`strict_task_identity=true`；`sft_task_alignment_candidates.json` 仅保留为
-审计证据，不需要 reviewed map，代码也不会猜测或重新引入这些记录。
+基础语料 data/sft/travel_sft_public.json 不可覆盖。合并输出必须是派生路径；脚本
+会拒绝相对/绝对路径等价的 in-place overwrite。
 
-DeepSeek-V4-Flash 的 SFT 采集必须启用 Thinking，并让导出的每一个工具回合
-包含非空 `<think>...</think>`：
+## Replay cleaner
 
-```powershell
-python -m travel_grpo.evaluation.eval `
-  --model_name deepseek-v4-flash `
-  --sft-collection --thinking enabled --include-think --require-think `
-  --task-pool-manifest .\data\task_pools\travel_task_pools.json `
-  --task-pool sft `
-  --max_turns 25 --save_name deepseek_teacher_sft
-```
+cleaner 只根据公共 transcript、工具参数、tool feedback 和可选私有 task sidecar
+回放协议。它不生成 candidate filter，也不把私有 label 添加回 messages。
 
-首次真实采集先将 `--task-pool sft_smoke`（固定分层 20-task）并使用
-`pass_k=2` 的 Teacher cache；smoke 通过后改为 `--task-pool sft`，沿用同一
-`--save_name`/cache 即可从已完成的 task/pass 继续，不会重复调用。
+可修复错误（如 action-before-search、answer-before-search、cross-aspect、repeated
+search、invalid visible ID、duplicate answer、vague action）会保留在完整上下文中，
+错误 Assistant turn 的 assistant_train_mask 为 0；之后的合法修复 turn 可以为 1。
 
-这一步只生成 Teacher cache，不覆盖仓库中的 244 条原始文件；6 条 quarantine
-记录不会进入采集清单。API 的
-`reasoning_content` 在工作 transcript 中保持独立字段；为兼容旧数据，cache
-中的 SFT 导出仍可包含 `<think>` 与 `<tool_call>` 文本。
+fatal 情况（malformed tool JSON、missing tool call、reasoning/tool 截断、tool ID
+错位、observation 错位、环境/API failure、无法修复的终局 Answer）从 offending turn
+开始删除不可恢复后缀。清洗后的终局重新计算分类，不能因为原始轨迹曾失败就自动把
+修复后的成功样本判为 wrong。
 
-## 2. 合并、清洗和分类
+## Canonical schema
 
-基础语料始终是 `data/sft/travel_sft_public.json`。新 cache 通过 `--input` 显式传入，
-脚本只删除 canonical 公共内容完全相同的重复记录；同一 task 的不同合法轨迹
-会保留。默认 `require-think`，且默认 32K、超长报错：
-
-```powershell
-python -m travel_grpo.collection.merge_travel_sft `
-  --base .\data\sft\travel_sft_public.json `
-  --input .\outputs\evaluation\deepseek_teacher_sft_teacher_cache.json `
-  --output .\data\sft\travel_sft_canonical.jsonl `
-  --audit-output .\data\sft\travel_sft_canonical.audit.json `
-  --manifest-output .\data\sft\travel_sft_canonical.manifest.json `
-  --tokenizer Qwen/Qwen3.5-4B --max-length 32768 `
-  --split-output-dir .\data\sft `
-  --task-pool-manifest .\data\task_pools\travel_task_pools.json
-```
-
-`--tokenizer` 用于按 Qwen 原生 template 做精确 token 长度审计，首次运行需要
-本地缓存该 tokenizer；不希望联网时可传本地路径。没有安全 task ID 对齐时，
-记录会进入 `infrastructure_invalid`，不会猜测；那 6 条历史记录已经被
-`quarantined_sft` 明确弃用，并在 canonical 合并前直接丢弃。不要用初始文本做多对一去重。
-
-输出包括：
-
-- `*.jsonl`：canonical 完整轨迹（每行一个完整 episode）；
-- `*.train.jsonl`：SFT 可用行；
-- `*.strict_gold.jsonl`、`*.recoverable_correct.jsonl`、`*.partial_correct.jsonl`、
-  `*.totally_wrong.jsonl` 和 quarantine 文件；
-- `*.audit.json`：私有清洗事件、任务对齐和终局诊断；
-- `*.manifest.json`：schema/template hash、长度分位数、分类和有效监督 token。
-
-正式训练使用 `data/sft/travel_sft_qwen35_split/train.jsonl` 和
-`data/sft/travel_sft_qwen35_split/val_gold10.jsonl`；后者只保留固定 10 个 task group
-中的 `strict_gold` 记录，`partial_correct` 与非 SFT 分类仅保留在 canonical
-和分类审计文件中。
-
-清洗器从错误 Assistant Turn 开始删除不可恢复错误的整个后缀。公开拒绝且有
-后续修复的 action-before-search、answer-before-search、跨 aspect、重复 Search、
-无效参数、不可见 ID、重复 Answer 和模糊 Action 会保留为 mask=0 上下文，修复
-Turn 为 mask=1。错误终局 Answer 会截断；非终局错误 Answer 保留但不监督。
-原始 fatal 后缀被截断而清洗后成功的轨迹仍分类为 `strict_gold`。
-
-检查 canonical 文件：
-
-```powershell
-python -m travel_grpo.training.sft.validate_travel_canonical `
-  --input .\data\sft\travel_sft_canonical.jsonl --max-length 32768
-```
-
-## 3. canonical 格式和 loss mask
-
-每条样本使用标准 `system/user/assistant/tool` 消息：
-
-```json
+~~~json
 {
   "schema_version": "travelgym-canonical-v1",
   "messages": [
     {"role": "user", "content": "..."},
-    {"role": "assistant", "content": "", "reasoning_content": "...", "tool_calls": [{"id": "call_0001", "type": "function", "function": {"name": "interact_with_env", "arguments": {"choice": "search", "content": "..."}}}]},
-    {"role": "tool", "tool_call_id": "call_0001", "name": "interact_with_env", "content": "..."}
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "...",
+      "tool_calls": [
+        {
+          "id": "call_0001",
+          "type": "function",
+          "function": {
+            "name": "interact_with_env",
+            "arguments": {"choice": "search", "content": "Search flight."}
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0001",
+      "name": "interact_with_env",
+      "content": "..."
+    }
   ],
-  "tools": [{"type": "function", "function": {"name": "interact_with_env", "parameters": {"type": "object", "properties": {"choice": {"type": "string"}, "content": {"type": "string"}}, "required": ["choice", "content"]}}}],
+  "tools": [{"type": "function", "function": {"name": "interact_with_env"}}],
   "enable_thinking": true,
-  "assistant_train_mask": [0, 1, 0]
+  "assistant_train_mask": [0, 1, 0],
+  "sample_weight": 1.0
 }
-```
+~~~
 
-`function.arguments` 在 canonical 内部是 dict；发送 OpenAI-compatible 请求时由
-`verl.tools.travel_tool_adapter` 转成 JSON string。`assistant_train_mask` 与
-`messages` 等长：system/user/tool 为 0，正确 Search/具体 Action/正确 Answer
-及合法修复为 1；错误 Assistant（包括 CoT 和 tool call）整体为 0。完整轨迹
-只对应一个 Dataset 样本，绝不按正确 Turn 展开前缀样本。Qwen3.5 原生
-`apply_chat_template(..., enable_thinking=True)` 直接生成 input IDs，token-level
-mask 通过 `travel_grpo.training.sft.qwen35_mask` 对齐，不使用字符截断。
+校验要求包括 schema version、message role、tool_call_id 配对、工具名/choice/content、
+mask 长度、thinking 字段和无私有字段泄漏。canonical hash 排除 audit-only annotation，
+只对公开内容去重。
 
-分类权重：strict/recoverable=1.0，partial=0.5（必须存在监督 Turn），
-totally_wrong、infrastructure_invalid、overlength 不进入 SFT。
+## Token-level mask
 
-## 4. VERL LoRA SFT
+Qwen3.5 原生 template 先将完整 message sequence 渲染为 input IDs，再由
+travel_grpo.training.sft.qwen35_mask 将 message-level mask 对齐到 token spans：
 
-`verl/trainer/config/travel_qwen35_sft.yaml` 是权威配置，默认
-`Qwen/Qwen3.5-4B`、LoRA rank 16、全局 trajectory batch 8、micro batch 1、
-3 epochs、32K 最大长度、`truncation=error` 和原生 Qwen template。490 条训练
-轨迹对应每 epoch 62 个 optimizer steps；每个 epoch 都保存 checkpoint，最终模型
-应结合 held-out TravelGym 成功率在 epoch 1/2/3 中选择，而不是固定使用最后一个。
+- user/tool/system 和 padding token 的 loss mask 为 0；
+- 被选中的 assistant turn 的 reasoning 与 tool-call token 均为 1；
+- 不监督 assistant 的可见前缀、错误 turn 或模板控制 token；
+- 动态 padding 只补当前 batch，attention/position/loss mask 的 padding 区域为 0；
+- 32K 是硬上限，不能用字符截断掩盖超长。
 
-训练样本保持原始完整 token stream，不再逐条补到 32K。训练集先按原生 Qwen
-template 的精确 token 长度分桶并打乱 batch 顺序，再在每个本地 batch 内右侧补齐
-到最长轨迹（向上取 128 的倍数）；attention、position 和所有 loss mask 的 padding
-区域均为 0。32K 仍是硬上限，合法轨迹不会被截断。不要把不同 trajectory 直接
-拼成一条可互相 attention 的序列；若未来启用 sequence packing，必须使用隔离的
-attention block 和 position IDs。
+训练样本保持一个完整 episode 一个 dataset row；不要把每个正确 turn 展开为独立
+prefix，因为那会改变长程 credit assignment 和 task 分布。
 
-启动命令：
+## Split 与审计
 
-```bash
-torchrun --standalone --nproc_per_node=1 -m verl.trainer.fsdp_sft_trainer \
-  --config-name=travel_qwen35_sft \
-  trainer.n_gpus_per_node=1 \
-  model.partial_pretrain=Qwen/Qwen3.5-4B
-```
+travel_grpo.training.sft.sft_split 先按 task group 选择固定 10 个 strict-gold
+validation group，再将剩余可监督轨迹写入 train。split manifest 保存 tokenizer、
+seed、任务键、数量和 token audit 状态。当前 checked-in split 为 490 train / 10 val。
 
-该 TravelGym SFT 配置默认使用 SwanLab 记录训练指标和验证样本。训练服务器
-上可在项目根目录 `.env` 设置 `SWANLAB_API_KEY`；无网络时设置
-`SWANLAB_MODE=local` 或 `offline`。
-
-不同 VERL 版本的入口参数可能略有差异；必须确认 dataloader 实际读取
-`assistant_train_mask` 和 `sample_weight`。`configs/sft/qwen3_customized.yaml` 仅保留
-旧 ShareGPT renderer 的回归用途，不支持 canonical 逐 Turn mask，不应作为
-本管线的权威训练配置。
+*.audit.json 保留私有 replay event、任务对齐和终局诊断；*.manifest.json 保留公开可
+复现所需的 schema/template hash、长度分位数、类别和监督 token 统计。二者不能被误
+当作模型输入。
