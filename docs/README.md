@@ -40,6 +40,7 @@ TravelGym 把多 aspect 旅行规划变成一个长程交互任务：模型必�
 - 重新构造数据： [任务池与 Teacher 数据](data_collection.md) → [SFT 管线](sft_pipeline.md) → [SFT 操作指南](sft.md)。
 - 修改环境或工具： [公开协议](travel_public_protocol.md) → [Reward](reward.md) → [TravelGym README](../environments/TravelGym/README.md)。
 - 修改评测： [评测数据集](evaluation_dataset.md) → [评测流水线](evaluation.md) → [Final-200 plan](/root/autodl-tmp/travelling-grpo-longhorizon/src/travel_grpo/evaluation/final200.py)。
+- 查看实验复盘： [训练与评测分析报告](experiment_report.md)。
 - 整理仓库： [仓库结构](repository_layout.md) → [项目源码说明](../src/travel_grpo/README.md)。
 
 ## 文档分层原则

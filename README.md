@@ -264,4 +264,5 @@ tests/                           协议、数据、训练入口和布局检查
 - 数据和 SFT： [任务池与 Teacher 数据](docs/data_collection.md)、[SFT 操作指南](docs/sft.md)；
 - GRPO 训练： [GRPO 训练文档](docs/grpo.md)、[阶段预检](docs/grpo_overfit_preflight.md)；
 - 模型比较： [评测流水线](docs/evaluation.md)、[Final-200 数据集](docs/evaluation_dataset.md)；
+- 实验复盘： [训练与评测分析报告](docs/experiment_report.md)；
 - 目录和开发： [训练链路](docs/travel_training_chain.md)、[仓库结构](docs/repository_layout.md)。
