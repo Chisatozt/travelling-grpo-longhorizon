@@ -93,8 +93,18 @@ class EnvironmentManager:
         env_config.one_choice_per_aspect = True
         env_config.require_action_before_answer = False
         env_config.reward_version = "travelgym-terminal-v2"
+        if "enable_actor_aspect_extraction" in kwargs:
+            from travelgym.env.actor_aspects import actor_aspect_extraction_enabled
+
+            env_config.enable_actor_aspect_extraction = actor_aspect_extraction_enabled(
+                kwargs["enable_actor_aspect_extraction"]
+            )
 
         env = travelgym.TravelEnv(config=env_config)
+        if env_config.enable_actor_aspect_extraction and hasattr(
+            env, "set_actor_aspect_extraction"
+        ):
+            env.set_actor_aspect_extraction(kwargs.get("actor_aspect_result"))
         env._model_max_attempts = max(
             1, int(os.environ.get("MODEL_MAX_ATTEMPTS", "3"))
         )

@@ -88,6 +88,7 @@ from verl.protocol import make_1d_object_array
 from verl.third_party.sglang import parallel_state as sglang_ps
 from verl.tools.base_tool import BaseTool
 from verl.tools.travel_reward_metrics import (
+    TRAVEL_ACTOR_ASPECT_METRIC_NAMES,
     TRAVEL_QUALITY_METRIC_NAMES,
     TRAVEL_REWARD_METRIC_NAMES,
     TRAVEL_USER_METRIC_NAMES,
@@ -334,6 +335,18 @@ class SGLangRollout(BaseRollout):
         super().__init__()
         self.config = config
         multi_turn_config = config.get("multi_turn", {})
+        from travelgym.env.actor_aspects import actor_aspect_extraction_enabled
+
+        extraction_flag = config.get("enable_actor_aspect_extraction")
+        if extraction_flag is None:
+            extraction_flag = multi_turn_config.get("enable_actor_aspect_extraction")
+        self._enable_actor_aspect_extraction = actor_aspect_extraction_enabled(
+            extraction_flag
+        )
+        self._actor_aspect_extraction_max_tokens = max(
+            1,
+            int(multi_turn_config.get("actor_aspect_extraction_max_tokens", 128)),
+        )
         self._max_new_tokens_per_turn = int(
             multi_turn_config.get("max_new_tokens_per_turn", 2048)
         )
@@ -349,18 +362,43 @@ class SGLangRollout(BaseRollout):
         self._template_token_reserve = int(
             multi_turn_config.get("template_token_reserve", 32)
         )
+        context_cleanup_config = config.get("context_cleanup")
+        if context_cleanup_config is None:
+            context_cleanup_config = multi_turn_config.get("context_cleanup", {})
+        if context_cleanup_config is None:
+            context_cleanup_config = {}
+        self._context_cleanup_enabled = bool(
+            context_cleanup_config.get("enabled", False)
+        )
+        self._context_cleanup_target_tokens = int(
+            context_cleanup_config.get("target_context_tokens", 20000)
+        )
+        self._context_cleanup_template_margin = int(
+            context_cleanup_config.get(
+                "template_margin_tokens", self._template_token_reserve
+            )
+        )
+        self._next_turn_reserve = (
+            self._max_reasoning_tokens_per_turn
+            + self._max_tool_call_tokens_per_turn
+            + self._tool_response_token_reserve
+            + self._context_cleanup_template_margin
+        )
         if (
             self._max_new_tokens_per_turn <= 0
             or self._max_reasoning_tokens_per_turn <= 0
             or self._max_tool_call_tokens_per_turn <= 0
             or self._tool_response_token_reserve <= 0
             or self._template_token_reserve <= 0
+            or self._context_cleanup_target_tokens <= 0
+            or self._context_cleanup_template_margin < 0
         ):
             raise ValueError(
                 "multi_turn token budgets must be positive: "
                 "max_new_tokens_per_turn, max_reasoning_tokens_per_turn, "
                 "max_tool_call_tokens_per_turn, tool_response_token_reserve, "
-                "template_token_reserve"
+                "template_token_reserve, context_cleanup.target_context_tokens "
+                "and context_cleanup.template_margin_tokens"
             )
         if self._max_reasoning_tokens_per_turn + self._max_tool_call_tokens_per_turn > self._max_new_tokens_per_turn:
             raise ValueError(
@@ -848,13 +886,26 @@ class SGLangRollout(BaseRollout):
         max_new_tokens_per_turn: int | None = None,
         phase: str = "generation",
     ) -> int:
-        current_response_tokens = max(0, len(generation_prompt_ids) - len(req.prompt_ids))
+        active_segment = getattr(req, "active_segment", None)
+        if active_segment is not None:
+            fragment_prompt_tokens = int(
+                active_segment.get("start_input", len(req.prompt_ids))
+            )
+        else:
+            fragment_prompt_tokens = len(req.prompt_ids)
+        current_response_tokens = max(
+            0, len(generation_prompt_ids) - fragment_prompt_tokens
+        )
+        fragment_response_limit = min(
+            int(req.max_response_len),
+            max(0, int(req.max_model_len) - fragment_prompt_tokens),
+        )
         phase_cap = int(max_new_tokens_per_turn or self._max_new_tokens_per_turn)
         max_new_tokens, budget_clamped = compute_generation_budget(
             generation_prompt_tokens=len(generation_prompt_ids),
             current_response_tokens=current_response_tokens,
             max_model_len=req.max_model_len,
-            max_response_len=req.max_response_len,
+            max_response_len=fragment_response_limit,
             max_new_tokens_per_turn=phase_cap,
             tool_response_token_reserve=self._tool_response_token_reserve,
             template_token_reserve=self._template_token_reserve,
@@ -866,23 +917,62 @@ class SGLangRollout(BaseRollout):
             response_tokens=current_response_tokens,
             generation_prompt_tokens=len(generation_prompt_ids),
             current_response_tokens=current_response_tokens,
-            remaining_response_tokens=max(0, req.max_response_len - current_response_tokens),
+            remaining_response_tokens=max(
+                0, fragment_response_limit - current_response_tokens
+            ),
             remaining_context_tokens=max(0, req.max_model_len - len(generation_prompt_ids)),
             max_new_tokens=max_new_tokens,
             budget_clamped=budget_clamped,
+            fragment_prompt_tokens=fragment_prompt_tokens,
+            fragment_response_limit=fragment_response_limit,
         )
         return max_new_tokens
 
     @staticmethod
     def _assert_request_budget(req: AsyncRolloutRequest) -> None:
         context_tokens = len(req.input_ids)
-        response_tokens = max(0, context_tokens - len(req.prompt_ids))
-        if context_tokens > req.max_model_len or response_tokens > req.max_response_len:
+        active_segment = getattr(req, "active_segment", None)
+        if active_segment is not None:
+            fragment_prompt_tokens = int(
+                active_segment.get("start_input", len(req.prompt_ids))
+            )
+        else:
+            fragment_prompt_tokens = len(req.prompt_ids)
+        response_tokens = max(0, context_tokens - fragment_prompt_tokens)
+        response_limit = min(
+            int(req.max_response_len),
+            max(0, int(req.max_model_len) - fragment_prompt_tokens),
+        )
+        if context_tokens > req.max_model_len or response_tokens > response_limit:
             raise RolloutLengthExceededError(
                 f"request {req.request_id} exceeded cumulative token budget: "
                 f"context={context_tokens}/{req.max_model_len}, "
                 f"response={response_tokens}/{req.max_response_len}"
             )
+
+    def _maybe_cleanup_context(
+        self,
+        req: AsyncRolloutRequest,
+        *,
+        reason: str,
+        force: bool = False,
+        require_next_turn: bool = True,
+    ) -> dict:
+        fallback_reserve = (
+            int(getattr(self, "_max_reasoning_tokens_per_turn", 2560))
+            + int(getattr(self, "_max_tool_call_tokens_per_turn", 512))
+            + int(getattr(self, "_tool_response_token_reserve", 6144))
+            + int(getattr(self, "_template_token_reserve", 32))
+        )
+        return req.maybe_cleanup_context(
+            self.tokenizer,
+            enabled=getattr(self, "_context_cleanup_enabled", False),
+            target_context_tokens=getattr(self, "_context_cleanup_target_tokens", 20000),
+            next_turn_reserve=getattr(self, "_next_turn_reserve", fallback_reserve),
+            reason=reason,
+            force=force,
+            require_next_turn=require_next_turn,
+        )
 
     @staticmethod
     def _is_length_exception(exc: Exception) -> bool:
@@ -916,7 +1006,8 @@ class SGLangRollout(BaseRollout):
         req: AsyncRolloutRequest,
     ) -> dict[str, float]:
         """Capture API usage accumulated before an invalid rollout is released."""
-        metrics = {name: 0.0 for name in TRAVEL_USER_METRIC_NAMES}
+        metric_names = (*TRAVEL_USER_METRIC_NAMES, *TRAVEL_ACTOR_ASPECT_METRIC_NAMES)
+        metrics = {name: 0.0 for name in metric_names}
         for name in req.tools_kwargs:
             tool = self._tool_map.get(name)
             getter = getattr(tool, "get_reward_metadata", None)
@@ -933,7 +1024,7 @@ class SGLangRollout(BaseRollout):
                 continue
             if not isinstance(metadata, dict):
                 continue
-            for metric_name in TRAVEL_USER_METRIC_NAMES:
+            for metric_name in metric_names:
                 try:
                     metrics[metric_name] += float(metadata.get(metric_name, 0.0))
                 except (TypeError, ValueError):
@@ -970,6 +1061,14 @@ class SGLangRollout(BaseRollout):
         invalid.response_loss_mask = []
         invalid.turn_boundaries = []
         invalid.conversation_histories = []
+        # Keep the append-only archive and cleanup diagnostics for export, but
+        # do not expose an earlier fragment as a trainable response after the
+        # request has been quarantined.  Partial fragments remain in a
+        # separate archive field so quarantine does not erase their ledger.
+        invalid.archive_segment_records = deepcopy(invalid.segment_records)
+        invalid.segment_records = []
+        invalid.active_segment = None
+        invalid.active_turn = {}
         invalid.metrics = {}
         invalid.reward_scores = {
             "interact_with_env": 0.0,
@@ -977,7 +1076,10 @@ class SGLangRollout(BaseRollout):
             "interact_with_env_terminal_only": 1.0,
             **{
                 f"interact_with_env_{metric_name}": 0.0
-                for metric_name in TRAVEL_QUALITY_METRIC_NAMES
+                for metric_name in (
+                    *TRAVEL_QUALITY_METRIC_NAMES,
+                    *TRAVEL_ACTOR_ASPECT_METRIC_NAMES,
+                )
             },
             **{
                 f"interact_with_env_{metric_name}": value
@@ -985,11 +1087,17 @@ class SGLangRollout(BaseRollout):
             },
         }
         invalid.finish_reason = finish_reason.value
-        invalid.length_events = []
+        invalid.length_events = deepcopy(req.length_events)
         invalid.record_length_event(
             phase,
             budget_clamped=finish_reason == FinishReasonTypeEnum.LENGTH,
             invalid=True,
+        )
+        invalid.length_events[-1].update(
+            {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:240],
+            }
         )
         logger.warning(
             "Quarantined invalid rollout request %s during %s: %s",
@@ -1170,22 +1278,12 @@ class SGLangRollout(BaseRollout):
                         tool_response_tokens=len(_req.input_ids) - before_tool_response_tokens,
                         tool_response_count=len(tool_call_results),
                     )
-                    if (
-                        len(_req.input_ids) > _req.max_model_len
-                        or len(_req.input_ids) - len(_req.prompt_ids) > _req.max_response_len
-                    ):
-                        raise RolloutLengthExceededError(
-                            f"request {_req.request_id} exceeded cumulative token budget "
-                            f"after tool response: context={len(_req.input_ids)}/"
-                            f"{_req.max_model_len}, response={len(_req.input_ids) - len(_req.prompt_ids)}/"
-                            f"{_req.max_response_len}"
-                        )
                     overall_stop = False
                     for tool_call, result in zip(parsed_tool_calls, tool_call_results):
                         # Keep compatibility with ordinary three-field tools;
                         # InteractTool additionally returns public control
                         # metadata and a stop flag.
-                        resp, reward, metrics = result[0], result[1], result[-1]
+                        _resp, reward, metrics = result[0], result[1], result[-1]
                         is_done = bool(result[2]) if len(result) >= 6 else False
                         choice = result[3] if len(result) >= 6 else tool_call.function.name
                         content = result[4] if len(result) >= 6 else ""
@@ -1200,13 +1298,70 @@ class SGLangRollout(BaseRollout):
                             )
                         if is_done:
                             overall_stop = True
-                    if overall_stop or len(_req.input_ids) >= self.config.max_model_len:
+                    if self._context_cleanup_enabled:
+                        _req.complete_turn(
+                            conversation_histories[-1].get("turn_events", []),
+                            conversation_histories[-1],
+                        )
+                    cleanup_result = self._maybe_cleanup_context(
+                        _req,
+                        reason="after_tool_response",
+                        force=len(_req.input_ids) > _req.max_model_len,
+                        require_next_turn=not overall_stop,
+                    )
+                    if cleanup_result.get("attempted"):
+                        _req.record_length_event(
+                            "context_cleanup",
+                            cleanup_success=bool(cleanup_result.get("success", False)),
+                            cleanup_released_tokens=int(
+                                cleanup_result.get("released_tokens", 0)
+                            ),
+                            cleanup_after_context_tokens=int(
+                                cleanup_result.get("after_context_tokens", len(_req.input_ids))
+                            ),
+                        )
+                    legacy_response_over_limit = (
+                        not self._context_cleanup_enabled
+                        and len(_req.input_ids) - len(_req.prompt_ids) > _req.max_response_len
+                    )
+                    if len(_req.input_ids) > _req.max_model_len or legacy_response_over_limit:
+                        raise RolloutLengthExceededError(
+                            f"request {_req.request_id} exceeded cumulative token budget "
+                            f"after tool response: context={len(_req.input_ids)}/"
+                            f"{_req.max_model_len}, response="
+                            f"{len(_req.input_ids) - len(_req.prompt_ids)}/{_req.max_response_len}"
+                        )
+                    if overall_stop or (
+                        not self._context_cleanup_enabled
+                        and len(_req.input_ids) >= self.config.max_model_len
+                    ):
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         break
                     _req.state = AsyncRolloutRequestStateEnum.RUNNING
                 else:
                     raise ValueError(f"Unexpected tool calling last message state: {_req.messages[-1]}")
             elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
+                # The cleanup check runs before a new generation marker is
+                # appended.  It cannot interrupt a half-generated reasoning
+                # or tool-call phase.
+                cleanup_result = self._maybe_cleanup_context(
+                    _req,
+                    reason="before_next_turn",
+                    require_next_turn=True,
+                )
+                if cleanup_result.get("attempted"):
+                    _req.record_length_event(
+                        "context_cleanup",
+                        cleanup_success=bool(cleanup_result.get("success", False)),
+                        cleanup_released_tokens=int(
+                            cleanup_result.get("released_tokens", 0)
+                        ),
+                        cleanup_after_context_tokens=int(
+                            cleanup_result.get(
+                                "after_context_tokens", len(_req.input_ids)
+                            )
+                        ),
+                    )
                 # The engine call computes the remaining cumulative budget and
                 # raises a typed length error when no safe turn can fit.
                 turn_boundaries.append(len(_req.input_ids))
@@ -1216,8 +1371,12 @@ class SGLangRollout(BaseRollout):
                     "content": "",
                     "turn_idx": len(conversation_histories),
                 })
+                if self._context_cleanup_enabled:
+                    _req.begin_turn(current_turns)
                 if _req.tool_schemas and self._function_call_parser:
                     reasoning_prompt_ids = _req.get_generation_prompt_ids(self.tokenizer)
+                    if self._context_cleanup_enabled:
+                        _req.ensure_active_segment(reasoning_prompt_ids)
                     reasoning_output = await self._handle_engine_call(
                         _req,
                         do_sample,
@@ -1231,6 +1390,11 @@ class SGLangRollout(BaseRollout):
                     reasoning_text = str(reasoning_output["text"] or "")
                     reasoning_finish = FinishReasonTypeEnum.from_str(
                         reasoning_output["meta_info"]["finish_reason"]["type"]
+                    )
+                    _req.record_model_output(
+                        "reasoning_generation",
+                        reasoning_text,
+                        finish_reason=reasoning_finish.value,
                     )
                     if "</think>" in reasoning_text:
                         reasoning_content, trailing_content = reasoning_text.split("</think>", 1)
@@ -1264,6 +1428,11 @@ class SGLangRollout(BaseRollout):
                     tool_finish = FinishReasonTypeEnum.from_str(
                         tool_output["meta_info"]["finish_reason"]["type"]
                     )
+                    _req.record_model_output(
+                        "tool_call_generation",
+                        tool_content,
+                        finish_reason=tool_finish.value,
+                    )
                     try:
                         parsed_tool_calls = self._parse_tool_call_output(_req, tool_content)
                     except RolloutProtocolError:
@@ -1285,10 +1454,24 @@ class SGLangRollout(BaseRollout):
                     finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
                     _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
                 else:
-                    output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
+                    generation_prompt_ids = _req.get_generation_prompt_ids(self.tokenizer)
+                    if self._context_cleanup_enabled:
+                        _req.ensure_active_segment(generation_prompt_ids)
+                    output = await self._handle_engine_call(
+                        _req,
+                        do_sample,
+                        is_validate,
+                        generation_prompt_ids=generation_prompt_ids,
+                        **kwargs,
+                    )
                     content = output["text"]
                     finish_reason_type = FinishReasonTypeEnum.from_str(
                         output["meta_info"]["finish_reason"]["type"]
+                    )
+                    _req.record_model_output(
+                        "generation",
+                        str(content or ""),
+                        finish_reason=finish_reason_type.value,
                     )
                     current_turns += 1
                     _req.add_assistant_message(self.tokenizer, content)
@@ -1302,6 +1485,8 @@ class SGLangRollout(BaseRollout):
                         raise RolloutProtocolError(
                             f"request {_req.request_id} emitted a tool call without a tool schema"
                         )
+                    if self._context_cleanup_enabled:
+                        _req.complete_turn([], conversation_histories[-1])
                     break
 
         if current_turns >= self.config.multi_turn.max_turns:
@@ -1410,15 +1595,112 @@ class SGLangRollout(BaseRollout):
             )
         return output
 
+    async def _extract_actor_aspects(self, _req: AsyncRolloutRequest):
+        """Run one inference-only aspect planning call before environment creation."""
+
+        from travelgym.env.actor_aspects import (
+            ActorAspectExtractionResult,
+            build_actor_aspect_messages,
+            first_user_requirement,
+            new_actor_aspect_telemetry,
+            parse_actor_aspect_response,
+        )
+
+        telemetry = new_actor_aspect_telemetry()
+        messages = build_actor_aspect_messages(
+            first_user_requirement(_req.messages)
+        )
+        telemetry["actor_aspect_extraction_calls"] = 1
+        started = time.perf_counter()
+        try:
+            try:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+            if isinstance(prompt_ids, dict):
+                prompt_ids = prompt_ids.get("input_ids", [])
+            if hasattr(prompt_ids, "tolist"):
+                prompt_ids = prompt_ids.tolist()
+            if prompt_ids and isinstance(prompt_ids[0], (list, tuple)):
+                prompt_ids = prompt_ids[0]
+            prompt_ids = [int(token_id) for token_id in prompt_ids]
+            telemetry["actor_aspect_extraction_prompt_tokens"] = len(prompt_ids)
+            with self.update_sampling_params(
+                n=1,
+                top_k=-1,
+                top_p=1.0,
+                temperature=0.0,
+                max_new_tokens=getattr(
+                    self, "_actor_aspect_extraction_max_tokens", 128
+                ),
+                skip_special_tokens=True,
+                spaces_between_special_tokens=True,
+            ):
+                output = await self._engine.async_generate(
+                    input_ids=prompt_ids,
+                    sampling_params=self.sampling_params,
+                    return_logprob=False,
+                )
+            meta_info = output.get("meta_info", {}) if isinstance(output, dict) else {}
+            if isinstance(meta_info, dict):
+                completion_tokens = meta_info.get("completion_tokens", 0) or 0
+                total_tokens = meta_info.get("total_tokens", 0) or 0
+            else:
+                completion_tokens = 0
+                total_tokens = 0
+            if not completion_tokens and isinstance(output, dict):
+                output_ids = output.get("output_ids", []) or []
+                completion_tokens = len(output_ids)
+            if not total_tokens:
+                total_tokens = len(prompt_ids) + int(completion_tokens)
+            telemetry["actor_aspect_extraction_completion_tokens"] = int(completion_tokens)
+            telemetry["actor_aspect_extraction_total_tokens"] = int(total_tokens)
+            telemetry["actor_aspect_extraction_wall_time_seconds"] = (
+                time.perf_counter() - started
+            )
+            text = output.get("text", "") if isinstance(output, dict) else ""
+            return parse_actor_aspect_response(text).with_telemetry(telemetry)
+        except Exception:
+            telemetry["actor_aspect_extraction_errors"] = 1
+            telemetry["actor_aspect_extraction_wall_time_seconds"] = (
+                time.perf_counter() - started
+            )
+            return ActorAspectExtractionResult(
+                format_error="actor_call_failed",
+            ).with_telemetry(telemetry)
+
     async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
         if _req.tool_schemas is not None:
+            extraction_enabled = bool(
+                getattr(self, "_enable_actor_aspect_extraction", False)
+            )
+            actor_aspect_result = None
+            if extraction_enabled:
+                actor_aspect_result = await self._extract_actor_aspects(_req)
             tool_creation_coroutines = []
             created_tools = []
             for tool_schema in _req.tool_schemas:
                 tool = self._tool_map[tool_schema.function.name]
-                create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                create_kwargs = dict(
+                    _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                )
                 create_kwargs["max_turns"] = self.config["multi_turn"]["max_turns"]
                 create_kwargs["model_name"] = self.config["multi_turn"]["model_name"]
+                if tool.name == "interact_with_env":
+                    create_kwargs["enable_actor_aspect_extraction"] = (
+                        extraction_enabled
+                    )
+                    if actor_aspect_result is not None:
+                        create_kwargs["actor_aspect_result"] = actor_aspect_result.to_dict()
                 tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
                 created_tools.append(tool)
             await asyncio.gather(*tool_creation_coroutines)
@@ -1510,6 +1792,13 @@ class SGLangRollout(BaseRollout):
         reward_scores = []
         turn_boundaries_list = []
         length_summaries = []
+        segment_records_list = []
+        cleanup_events_list = []
+        archive_messages_list = []
+        archive_model_outputs_list = []
+        archive_segment_records_list = []
+        archive_turns_list = []
+        length_events_list = []
         for req in sorted_output_req_list:
             assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
             assert len(req.input_ids) == len(req.attention_mask) == len(req.position_ids) == len(req.loss_mask), f"""Request {req.request_id} has different length of 
@@ -1540,17 +1829,50 @@ class SGLangRollout(BaseRollout):
             response_position_ids.append(torch.tensor(req.response_position_ids, dtype=torch.int, device=tgt_device))
             prompt_loss_mask.append(torch.tensor(req.prompt_loss_mask, dtype=torch.int, device=tgt_device))
             response_loss_mask.append(torch.tensor(req.response_loss_mask, dtype=torch.int, device=tgt_device))
-            messages.append({"messages": req.messages})
+            if self._context_cleanup_enabled:
+                messages.append(
+                    {
+                        # Keep the historical key for existing consumers, and
+                        # add explicit archive/active views so an export does
+                        # not look like one uninterrupted prompt after
+                        # compaction.
+                        "messages": req.messages,
+                        "archive_messages": req._archive_message_dicts(),
+                        "archive_model_outputs": req.archive_model_outputs,
+                        "archive_segment_records": req.archive_segment_records,
+                        "active_messages": req._message_dicts(),
+                    }
+                )
+            else:
+                messages.append({"messages": req.messages})
             conversation_histories.append(req.conversation_histories)
             reward_scores.append(req.reward_scores)
+            segment_records_list.append(req.segment_records)
+            cleanup_events_list.append(req.cleanup_events)
+            archive_messages_list.append(req._archive_message_dicts())
+            archive_model_outputs_list.append(req.archive_model_outputs)
+            archive_segment_records_list.append(req.archive_segment_records)
+            archive_turns_list.append(req.archive_turns)
+            length_events_list.append(req.length_events)
             length_summaries.append(
                 req.length_summary(finish_reason=req.finish_reason)
             )
 
-            # Convert turn boundaries to tensor format - FIXED: relative to response length
+            # Convert turn boundaries to tensor format.  Segmented rows have
+            # their own local boundaries; the legacy request-level boundaries
+            # are in the pre-compaction input coordinate system and cannot be
+            # projected onto the last fragment.
             response_length = len(req.response_ids)
             turn_boundary_tensor = torch.zeros(response_length, dtype=torch.int, device=tgt_device)
-            if hasattr(req, 'turn_boundaries') and req.turn_boundaries:
+            if req.segment_records:
+                local_boundaries = req.segment_records[-1].get("turn_boundaries", [])
+                for boundary_pos in local_boundaries:
+                    boundary_pos = int(boundary_pos)
+                    if 0 <= boundary_pos < response_length:
+                        turn_boundary_tensor[boundary_pos] = 1
+                if response_length and not bool(turn_boundary_tensor.any()):
+                    turn_boundary_tensor[0] = 1
+            elif hasattr(req, 'turn_boundaries') and req.turn_boundaries:
                 prompt_length = len(req.prompt_ids)
                 # Convert turn boundaries from input_ids space to response_ids space
                 for boundary_pos in req.turn_boundaries:
@@ -1559,7 +1881,8 @@ class SGLangRollout(BaseRollout):
                     if 0 <= response_pos < response_length:
                         turn_boundary_tensor[response_pos] = 1
                 # Ensure first turn always starts at position 0 if no boundary set
-                assert turn_boundary_tensor[0] == 1, f"First turn boundary should be at position 0, but got {turn_boundary_tensor[0]}"
+                if response_length:
+                    assert turn_boundary_tensor[0] == 1, f"First turn boundary should be at position 0, but got {turn_boundary_tensor[0]}"
             turn_boundaries_list.append(turn_boundary_tensor)
 
         prompt_ids = pad_sequence(
@@ -1636,17 +1959,33 @@ class SGLangRollout(BaseRollout):
             length_monitor["invalid_rollouts"] = float(
                 sum(summary.get("invalid_rollout", 0.0) for summary in length_summaries)
             )
+        non_tensor_batch = {
+            "messages": make_1d_object_array(messages),
+            # Keep one complete history as one object per task row.  A
+            # nested np.array construction changes rank when a retry
+            # contains one row with a uniform history length.
+            "conversation_histories": make_1d_object_array(conversation_histories),
+            "reward_scores": make_1d_object_array(reward_scores),
+        }
+        if self._context_cleanup_enabled:
+            non_tensor_batch.update(
+                {
+                    "segment_records": make_1d_object_array(segment_records_list),
+                    "cleanup_events": make_1d_object_array(cleanup_events_list),
+                    "archive_messages": make_1d_object_array(archive_messages_list),
+                    "archive_model_outputs": make_1d_object_array(archive_model_outputs_list),
+                    "archive_segment_records": make_1d_object_array(archive_segment_records_list),
+                    "archive_turns": make_1d_object_array(archive_turns_list),
+                    "length_events": make_1d_object_array(length_events_list),
+                }
+            )
         return DataProto(
             batch=batch,
-            non_tensor_batch={
-                "messages": np.array(messages),
-                # Keep one complete history as one object per task row.  A
-                # nested np.array construction changes rank when a retry
-                # contains one row with a uniform history length.
-                "conversation_histories": make_1d_object_array(conversation_histories),
-                "reward_scores": np.array(reward_scores),
+            non_tensor_batch=non_tensor_batch,
+            meta_info={
+                "travel_rollout_length": length_monitor,
+                "travel_context_cleanup_enabled": bool(self._context_cleanup_enabled),
             },
-            meta_info={"travel_rollout_length": length_monitor},
         )
 
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[AsyncRolloutRequest]:

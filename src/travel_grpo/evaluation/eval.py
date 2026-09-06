@@ -397,6 +397,8 @@ async def build_env(
     *,
     model_client=None,
     user_request_limit=None,
+    actor_client=None,
+    actor_model_name=None,
 ):
     gold = data["gold"]
     env_name = data["env_name"]
@@ -442,6 +444,27 @@ async def build_env(
     env._model_client = model_client
     env._request_semaphore = user_request_limit
     env._model_max_attempts = _positive_int_env("MODEL_MAX_ATTEMPTS", 3)
+
+    # Run the one-shot Actor planner before reset creates any task-specific
+    # public state.  Its prompt is built from only the first user message and
+    # the fixed category/JSON contract; the private ``gold`` identifier is not
+    # passed to this call.
+    from travelgym.env.actor_aspects import (
+        actor_aspect_extraction_enabled,
+        first_user_requirement,
+    )
+
+    if actor_aspect_extraction_enabled(
+        getattr(config, "enable_actor_aspect_extraction", None)
+    ):
+
+        actor_aspect_result = await _extract_actor_aspects_for_eval(
+            first_user_requirement(data.get("messages", [])),
+            client=actor_client if actor_client is not None else model_client,
+            model_name=str(actor_model_name or model_name),
+            telemetry=telemetry,
+        )
+        env.set_actor_aspect_extraction(actor_aspect_result)
     env.reset()
     return env
 
@@ -486,6 +509,14 @@ def _new_telemetry():
         "user_total_tokens": 0,
         "user_reasoning_tokens": 0,
         "user_wall_time_seconds": 0.0,
+        "actor_aspect_extraction_calls": 0,
+        "actor_aspect_extraction_errors": 0,
+        "actor_aspect_extraction_retries": 0,
+        "actor_aspect_extraction_prompt_tokens": 0,
+        "actor_aspect_extraction_completion_tokens": 0,
+        "actor_aspect_extraction_total_tokens": 0,
+        "actor_aspect_extraction_reasoning_tokens": 0,
+        "actor_aspect_extraction_wall_time_seconds": 0.0,
         "missing_think_turns": 0,
     }
 
@@ -578,6 +609,165 @@ def _retry_delay(attempt_index: int) -> float:
     """Small exponential backoff with jitter; never blocks longer than 8s."""
 
     return min(8.0, 1.0 * (2 ** max(0, int(attempt_index))) + random.random() * 0.5)
+
+
+def _add_actor_aspect_metric(telemetry, name: str, value: int | float = 1) -> None:
+    if not isinstance(telemetry, dict):
+        return
+    current = telemetry.get(name, 0)
+    try:
+        telemetry[name] = current + value
+    except TypeError:
+        telemetry[name] = value
+
+
+def _record_actor_aspect_usage(telemetry, response, elapsed_seconds: float) -> None:
+    """Record provider-reported usage for the separate planning call only."""
+
+    if not isinstance(telemetry, dict):
+        return
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = _usage_value(usage, "prompt_tokens", 0)
+    if not prompt_tokens:
+        prompt_tokens = _usage_value(usage, "prompt_token_count", 0)
+    completion_tokens = _usage_value(usage, "completion_tokens", 0)
+    if not completion_tokens:
+        completion_tokens = _usage_value(usage, "candidates_token_count", 0)
+    total_tokens = _usage_value(usage, "total_tokens", 0)
+    if not total_tokens:
+        total_tokens = _usage_value(usage, "total_token_count", 0)
+    if not total_tokens:
+        total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+    details = _usage_value(usage, "completion_tokens_details", None)
+    reasoning_tokens = _usage_value(details, "reasoning_tokens", 0)
+    if not reasoning_tokens:
+        reasoning_tokens = _usage_value(usage, "thoughts_token_count", 0)
+    for name, value in (
+        ("actor_aspect_extraction_prompt_tokens", prompt_tokens),
+        ("actor_aspect_extraction_completion_tokens", completion_tokens),
+        ("actor_aspect_extraction_total_tokens", total_tokens),
+        ("actor_aspect_extraction_reasoning_tokens", reasoning_tokens),
+        ("actor_aspect_extraction_wall_time_seconds", float(elapsed_seconds)),
+    ):
+        try:
+            _add_actor_aspect_metric(telemetry, name, int(value) if not name.endswith("seconds") else float(value))
+        except (TypeError, ValueError):
+            continue
+
+
+def _actor_aspect_response_text(response, model_name: str) -> str:
+    if "gemini" in str(model_name).casefold():
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", None) or []
+            text = "".join(str(getattr(part, "text", "") or "") for part in parts)
+            if text:
+                return text
+        return str(getattr(response, "text", "") or "")
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", "") if message is not None else ""
+    if isinstance(content, list):
+        return "".join(
+            str(item.get("text", "") or "") if isinstance(item, Mapping) else str(getattr(item, "text", "") or "")
+            for item in content
+        )
+    return str(content or "")
+
+
+async def _extract_actor_aspects_for_eval(
+    user_requirement: str,
+    *,
+    client,
+    model_name: str,
+    telemetry=None,
+):
+    """Run the bounded, inference-only Actor planning pass for native eval."""
+
+    from travelgym.env.actor_aspects import (
+        ActorAspectExtractionResult,
+        build_actor_aspect_messages,
+        new_actor_aspect_telemetry,
+        parse_actor_aspect_response,
+    )
+
+    metrics = telemetry if isinstance(telemetry, dict) else new_actor_aspect_telemetry()
+    messages = build_actor_aspect_messages(user_requirement)
+    if client is None:
+        _add_actor_aspect_metric(metrics, "actor_aspect_extraction_errors")
+        return ActorAspectExtractionResult(
+            format_error="actor_call_unavailable",
+        ).with_telemetry(metrics)
+
+    max_attempts = _positive_int_env("ACTOR_ASPECT_MAX_ATTEMPTS", 1)
+    max_output_tokens = _positive_int_env("ACTOR_ASPECT_MAX_OUTPUT_TOKENS", 128)
+    for attempt_index in range(max_attempts):
+        _add_actor_aspect_metric(metrics, "actor_aspect_extraction_calls")
+        request_started = time.perf_counter()
+        try:
+            if "gemini" in str(model_name).casefold():
+                if Client is None or types is None:
+                    raise RuntimeError("Gemini SDK is not installed")
+                config = types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=max_output_tokens,
+                )
+                contents = [
+                    types.Content(
+                        role="user",
+                        parts=[types.Part(text=messages[0]["content"]), types.Part(text=messages[1]["content"])],
+                    )
+                ]
+                async with actor_request_semaphore:
+                    response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+            else:
+                request_kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "max_tokens": max_output_tokens,
+                    "n": 1,
+                }
+                if "deepseek" in str(model_name).casefold():
+                    request_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                elif "qwen3" in str(model_name).casefold():
+                    request_kwargs["extra_body"] = {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+                async with actor_request_semaphore:
+                    response = await client.chat.completions.create(**request_kwargs)
+            _record_actor_aspect_usage(
+                metrics,
+                response,
+                time.perf_counter() - request_started,
+            )
+            return parse_actor_aspect_response(
+                _actor_aspect_response_text(response, model_name)
+            ).with_telemetry(metrics)
+        except Exception as exc:
+            _add_actor_aspect_metric(metrics, "actor_aspect_extraction_errors")
+            _add_actor_aspect_metric(
+                metrics,
+                "actor_aspect_extraction_wall_time_seconds",
+                time.perf_counter() - request_started,
+            )
+            if attempt_index + 1 >= max_attempts or not _is_transient_provider_error(exc):
+                break
+            _add_actor_aspect_metric(metrics, "actor_aspect_extraction_retries")
+            await asyncio.sleep(_retry_delay(attempt_index))
+
+    return ActorAspectExtractionResult(
+        format_error="actor_call_failed",
+    ).with_telemetry(metrics)
 
 
 async def gen_response(client, data, schema, temperature, model_name, thinking=None, telemetry=None, reasoning_effort=None):
@@ -805,6 +995,8 @@ async def rollout(
             # historical single-client behavior when no override is given.
             model_client=user_model_client if user_model_client is not None else client,
             user_request_limit=user_request_semaphore,
+            actor_client=client,
+            actor_model_name=model_name,
         )
         while turn < max_turns:
             if "gemini" in model_name:
@@ -936,7 +1128,11 @@ async def rollout(
             reward_report = None
             total_reward = turn_rewards
         telemetry["rollout_elapsed_seconds"] = time.perf_counter() - rollout_started
-        telemetry["api_total_tokens"] = telemetry["actor_total_tokens"] + telemetry["user_total_tokens"]
+        telemetry["api_total_tokens"] = (
+            telemetry["actor_total_tokens"]
+            + telemetry["user_total_tokens"]
+            + telemetry["actor_aspect_extraction_total_tokens"]
+        )
         return {
             "hash_id": hash_id,
             "reward": total_reward,
@@ -953,7 +1149,11 @@ async def rollout(
         total_reward = 0.0
         report = invalid_travel_report("evaluation_timeout")
         telemetry["rollout_elapsed_seconds"] = time.perf_counter() - rollout_started
-        telemetry["api_total_tokens"] = telemetry["actor_total_tokens"] + telemetry["user_total_tokens"]
+        telemetry["api_total_tokens"] = (
+            telemetry["actor_total_tokens"]
+            + telemetry["user_total_tokens"]
+            + telemetry["actor_aspect_extraction_total_tokens"]
+        )
         return {
             "hash_id": hash_id,
             "reward": total_reward,
@@ -971,7 +1171,11 @@ async def rollout(
         reason = "missing_think" if telemetry.get("missing_think_turns", 0) else "evaluation_error"
         report = invalid_travel_report(reason)
         telemetry["rollout_elapsed_seconds"] = time.perf_counter() - rollout_started
-        telemetry["api_total_tokens"] = telemetry["actor_total_tokens"] + telemetry["user_total_tokens"]
+        telemetry["api_total_tokens"] = (
+            telemetry["actor_total_tokens"]
+            + telemetry["user_total_tokens"]
+            + telemetry["actor_aspect_extraction_total_tokens"]
+        )
         return {
             "hash_id": hash_id,
             "reward": total_reward,
@@ -1434,6 +1638,14 @@ async def main():
             "api_endpoint_label": api_endpoint_label,
             "user_api_endpoint_label": user_api_endpoint_label,
             "user_model_name": os.environ.get("USER_MODEL_NAME", "gpt-4o"),
+            **(
+                {"actor_aspect_extraction_enabled": True}
+                if os.environ.get(
+                    "TRAVELGYM_ENABLE_ACTOR_ASPECT_EXTRACTION", "0"
+                ).strip().casefold()
+                in {"1", "true", "yes", "y", "on"}
+                else {}
+            ),
             "collection_run_id": run_id if args.sft_collection else None,
             "tool_schema": function,
             "task_manifest": travel_manifest,

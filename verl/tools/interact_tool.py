@@ -222,6 +222,23 @@ class InteractTool(BaseTool):
             "reward_version": str(report.get("reward_version", "unknown")),
             "terminal_only": True,
             "termination_reason": report.get("termination_reason"),
+            "actor_aspect_extraction_enabled": bool(
+                report.get("actor_aspect_extraction_enabled", False)
+            ),
+            # The plan and validation details are trainer-side diagnostics;
+            # they are never copied into tool feedback or Actor messages.
+            "actor_aspects": report.get("actor_aspects"),
+            "actor_aspects_raw": report.get("actor_aspects_raw"),
+            "actor_aspect_extraction_format_error": report.get(
+                "actor_aspect_extraction_format_error"
+            ),
+            "actor_aspect_extraction_invalid_aspects": report.get(
+                "actor_aspect_extraction_invalid_aspects", []
+            ),
+            "actor_aspect_extraction_duplicate_aspects": report.get(
+                "actor_aspect_extraction_duplicate_aspects", []
+            ),
+            "actor_aspect_extraction_direct_grpo_signal": False,
         }
         for key in TRAVEL_REWARD_METRIC_NAMES:
             try:

@@ -144,7 +144,7 @@ def make_eval_manifest(*, data_path: str, config: Mapping[str, Any], code_revisi
     }
 
 
-def summarize_terminal_report(report: Mapping[str, Any]) -> dict[str, float | str | bool]:
+def summarize_terminal_report(report: Mapping[str, Any]) -> dict[str, Any]:
     """Return stable, non-label metrics for evaluation tables."""
     if report.get("reward_version") != REWARD_VERSION:
         raise TravelContractError("unexpected TravelGym reward version")
@@ -180,8 +180,37 @@ def summarize_terminal_report(report: Mapping[str, Any]) -> dict[str, float | st
         "max_steps_reached",
         "max_steps_penalty",
         "total_penalty",
+        "actor_aspect_extraction_calls",
+        "actor_aspect_extraction_errors",
+        "actor_aspect_extraction_retries",
+        "actor_aspect_extraction_prompt_tokens",
+        "actor_aspect_extraction_completion_tokens",
+        "actor_aspect_extraction_total_tokens",
+        "actor_aspect_extraction_reasoning_tokens",
+        "actor_aspect_extraction_wall_time_seconds",
+        "actor_aspect_extraction_error_count",
+        "actor_aspect_plan_penalty",
     )
     summary.update({name: float(report.get(name, 0.0)) for name in numeric_metrics})
+    summary.update(
+        {
+            "actor_aspect_extraction_enabled": bool(
+                report.get("actor_aspect_extraction_enabled", False)
+            ),
+            "actor_aspects": report.get("actor_aspects"),
+            "actor_aspects_raw": report.get("actor_aspects_raw"),
+            "actor_aspect_extraction_format_error": report.get(
+                "actor_aspect_extraction_format_error"
+            ),
+            "actor_aspect_extraction_invalid_aspects": list(
+                report.get("actor_aspect_extraction_invalid_aspects", []) or []
+            ),
+            "actor_aspect_extraction_duplicate_aspects": list(
+                report.get("actor_aspect_extraction_duplicate_aspects", []) or []
+            ),
+            "actor_aspect_extraction_direct_grpo_signal": False,
+        }
+    )
     return summary
 
 

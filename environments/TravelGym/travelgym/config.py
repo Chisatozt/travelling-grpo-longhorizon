@@ -10,6 +10,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "y", "on"}
+
+
 # TravelGym can be used directly (without going through the evaluator), so it
 # loads the same repository-level .env on package import/configuration.
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -74,6 +81,13 @@ class TravelGymConfig:
     # even when no evidence turn was taken.  Training/evaluation can opt into
     # the stricter chain without changing the reducer's privacy boundary.
     require_action_before_answer: bool = False
+
+    # Experimental, inference-only planning pass.  The shared environment
+    # variable lets the training rollout and native evaluator opt in together;
+    # an explicit constructor value still takes precedence.
+    enable_actor_aspect_extraction: bool = field(
+        default_factory=lambda: _env_flag("TRAVELGYM_ENABLE_ACTOR_ASPECT_EXTRACTION")
+    )
 
     normalize_rewards: bool = False
     

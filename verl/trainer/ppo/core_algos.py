@@ -19,16 +19,18 @@ implement PPO-like algorithms.
 """
 
 __all__ = [
-    'register',
     "get_adv_estimator_fn",
     "AdvantageEstimator",
     "compute_terminal_group_advantage",
     "compute_grpo_multiturn_advantage",
     "redistribute_terminal_turn_credit",
+    "redistribute_segmented_terminal_turn_credit",
     "compute_terminal_component_advantages",
     "redistribute_behavior_component_turn_credit",
+    "redistribute_segmented_behavior_component_turn_credit",
     "turn_credit_conservation_error",
     "turn_credit_conservation_stats",
+    "segmented_turn_credit_conservation_stats",
 ]
 
 from collections import defaultdict
@@ -38,8 +40,6 @@ import numpy as np
 import torch
 
 import verl.utils.torch_functional as verl_F
-
-import math
 
 ADV_ESTIMATOR_REGISTRY = {}
 
@@ -808,7 +808,6 @@ def redistribute_terminal_turn_credit(
                 choice = str(history[turn_idx].get("choice", "")).casefold()
             turn_weights.append(max(0.0, weights.get(choice, 1.0)))
         total_weight = sum(turn_weights) or float(len(turn_weights))
-        total_tokens = float(len(valid_positions))
         base_total = terminal_advantages[row, valid_positions].sum()
         for (start, end), turn_weight in zip(zip(starts, ends), turn_weights):
             token_positions = [pos for pos in valid_positions if start <= pos < end]
@@ -1229,6 +1228,285 @@ def redistribute_behavior_component_turn_credit(
     return mixed, diagnostics
 
 
+def _segmented_turn_units(
+    row: int,
+    response_mask: torch.Tensor,
+    turn_boundaries: torch.Tensor,
+    history_item,
+    global_turn_indices=None,
+) -> list[dict]:
+    """Map one fragment's local boundary positions to global turn units."""
+    valid_positions = torch.where(response_mask[row].bool())[0].tolist()
+    if not valid_positions:
+        return []
+    starts = sorted(set(torch.where(turn_boundaries[row].bool())[0].tolist()))
+    starts = [position for position in starts if position < response_mask.shape[1]]
+    if not starts or starts[0] > valid_positions[0]:
+        starts.insert(0, valid_positions[0])
+    ends = starts[1:] + [response_mask.shape[1]]
+    history = history_item
+    if isinstance(history, dict):
+        history = [history]
+    if not isinstance(history, (list, tuple)):
+        history = []
+    indices = global_turn_indices
+    if isinstance(indices, torch.Tensor):
+        indices = indices.detach().cpu().tolist()
+    if not isinstance(indices, (list, tuple)):
+        indices = []
+    units = []
+    for local_idx, (start, end) in enumerate(zip(starts, ends)):
+        positions = [position for position in valid_positions if start <= position < end]
+        if not positions:
+            continue
+        item = history[local_idx] if local_idx < len(history) else {}
+        if not isinstance(item, dict):
+            item = {}
+        if local_idx < len(indices):
+            global_idx = int(indices[local_idx])
+        elif item.get("turn_idx") is not None:
+            global_idx = int(item["turn_idx"])
+        else:
+            global_idx = local_idx
+        units.append(
+            {
+                "global_turn": global_idx,
+                "row": row,
+                "positions": positions,
+                "history": item,
+            }
+        )
+    return units
+
+
+def _group_segment_indices(segment_trajectory_ids) -> dict[object, list[int]]:
+    groups: dict[object, list[int]] = defaultdict(list)
+    for row, trajectory_id in enumerate(segment_trajectory_ids):
+        if isinstance(trajectory_id, np.ndarray):
+            trajectory_id = trajectory_id.item()
+        try:
+            groups[trajectory_id].append(row)
+        except TypeError:
+            groups[str(trajectory_id)].append(row)
+    return groups
+
+
+def _ordered_segment_units(
+    rows: list[int],
+    response_mask: torch.Tensor,
+    turn_boundaries: torch.Tensor,
+    segment_histories,
+    segment_global_turn_indices,
+) -> list[dict]:
+    units = []
+    for row in rows:
+        history = segment_histories[row] if segment_histories is not None else []
+        indices = (
+            segment_global_turn_indices[row]
+            if segment_global_turn_indices is not None
+            else None
+        )
+        units.extend(
+            _segmented_turn_units(
+                row,
+                response_mask,
+                turn_boundaries,
+                history,
+                indices,
+            )
+        )
+    units.sort(key=lambda item: (int(item["global_turn"]), int(item["row"])))
+    return units
+
+
+def _segment_history_events(units: list[dict]) -> list[dict]:
+    return [_coalesce_turn_event(unit.get("history", {})) for unit in units]
+
+
+def _segmented_choice_turn_weights(units: list[dict], choice_weights: dict[str, float] | None) -> list[float]:
+    weights = {"search": 0.25, "action": 0.45, "answer": 0.30}
+    if choice_weights:
+        weights.update({str(key): float(value) for key, value in choice_weights.items()})
+    values = []
+    for event in _segment_history_events(units):
+        values.append(max(0.0, weights.get(str(event.get("choice", "")).casefold(), 1.0)))
+    total = sum(values)
+    return [value / total for value in values] if total > 0 else [1.0 / len(units)] * len(units)
+
+
+def redistribute_segmented_terminal_turn_credit(
+    terminal_advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: torch.Tensor,
+    segment_trajectory_ids,
+    segment_histories=None,
+    segment_global_turn_indices=None,
+    *,
+    choice_weights: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Redistribute terminal credit across local fragments using global turns.
+
+    ``segment_trajectory_ids`` is deliberately separate from the GRPO group
+    UID: it identifies one original rollout, so splitting a rollout cannot
+    create another group member or another terminal reward.
+    """
+    if terminal_advantages.shape != response_mask.shape:
+        raise ValueError("terminal_advantages and response_mask must have identical shapes")
+    if turn_boundaries.shape != response_mask.shape:
+        raise ValueError("turn_boundaries and response_mask must have identical shapes")
+    if len(segment_trajectory_ids) != terminal_advantages.shape[0]:
+        raise ValueError("segment trajectory ids must align with the batch")
+    output = torch.zeros_like(terminal_advantages)
+    for trajectory_id, rows in _group_segment_indices(segment_trajectory_ids).items():
+        del trajectory_id
+        units = _ordered_segment_units(
+            rows,
+            response_mask,
+            turn_boundaries,
+            segment_histories,
+            segment_global_turn_indices,
+        )
+        if not units:
+            for row in rows:
+                output[row] = terminal_advantages[row]
+            continue
+        base_total = sum(
+            terminal_advantages[unit["row"], unit["positions"]].sum()
+            for unit in units
+        )
+        weights = _segmented_choice_turn_weights(units, choice_weights)
+        for unit, weight in zip(units, weights):
+            positions = unit["positions"]
+            share = base_total * float(weight)
+            output[unit["row"], positions] = share / float(len(positions))
+    return output
+
+
+def redistribute_segmented_behavior_component_turn_credit(
+    terminal_advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    turn_boundaries: torch.Tensor,
+    segment_trajectory_ids,
+    segment_histories,
+    segment_global_turn_indices,
+    component_advantages: torch.Tensor,
+    component_names: list[str] | tuple[str, ...],
+    *,
+    mix_ratio: float = 0.30,
+    routing: dict | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Route behavior components over global turns while preserving fragments."""
+    if not 0.0 <= float(mix_ratio) <= 1.0:
+        raise ValueError("turn credit mix_ratio must be between 0 and 1")
+    if component_advantages.ndim != 2 or component_advantages.shape != (
+        terminal_advantages.shape[0],
+        len(component_names),
+    ):
+        raise ValueError("component_advantages and component_names are misaligned")
+
+    behavior = torch.zeros_like(terminal_advantages)
+    diagnostics: dict[str, float] = {"fallback_row_count": 0.0}
+    for _, rows in _group_segment_indices(segment_trajectory_ids).items():
+        units = _ordered_segment_units(
+            rows,
+            response_mask,
+            turn_boundaries,
+            segment_histories,
+            segment_global_turn_indices,
+        )
+        if not units:
+            for row in rows:
+                behavior[row] = terminal_advantages[row]
+                diagnostics["fallback_row_count"] += 1.0
+            continue
+        events = _segment_history_events(units)
+        if not any(bool(event.get("has_quality_event", False)) for event in events):
+            for row in rows:
+                behavior[row] = terminal_advantages[row]
+                diagnostics["fallback_row_count"] += 1.0
+            continue
+
+        nonempty = list(range(len(units)))
+        turn_credits = torch.zeros(
+            len(units),
+            device=terminal_advantages.device,
+            dtype=terminal_advantages.dtype,
+        )
+        source_row = rows[0]
+        for component_idx, component_name in enumerate(component_names):
+            value = component_advantages[source_row, component_idx]
+            weights = _behavior_component_turn_weights(
+                str(component_name),
+                float(value.detach().cpu()),
+                events,
+                routing,
+            )
+            filtered = {
+                idx: weights[idx]
+                for idx in nonempty
+                if idx < len(weights) and weights[idx] > 0
+            }
+            normalized = _normalized_turn_weights(filtered, len(units))
+            if not any(normalized):
+                normalized = _normalized_turn_weights(
+                    {idx: 1.0 for idx in nonempty}, len(units)
+                )
+            turn_credits += value * torch.tensor(
+                normalized,
+                device=turn_credits.device,
+                dtype=turn_credits.dtype,
+            )
+
+        total_tokens = float(
+            sum(len(unit["positions"]) for unit in units)
+        )
+        for unit_idx, unit in enumerate(units):
+            positions = unit["positions"]
+            behavior[unit["row"], positions] = (
+                total_tokens * turn_credits[unit_idx] / float(len(positions))
+            )
+
+    preprojection = segmented_turn_credit_conservation_stats(
+        terminal_advantages,
+        behavior,
+        response_mask,
+        segment_trajectory_ids,
+    )
+    behavior = _project_segmented_trajectory_credit_sum(
+        behavior,
+        terminal_advantages,
+        response_mask,
+        segment_trajectory_ids,
+    )
+    mixed = (1.0 - float(mix_ratio)) * terminal_advantages + float(mix_ratio) * behavior
+    mixed = _project_segmented_trajectory_credit_sum(
+        mixed,
+        terminal_advantages,
+        response_mask,
+        segment_trajectory_ids,
+    )
+    conservation = segmented_turn_credit_conservation_stats(
+        terminal_advantages,
+        mixed,
+        response_mask,
+        segment_trajectory_ids,
+    )
+    diagnostics.update(
+        {
+            "mix_ratio": float(mix_ratio),
+            "conservation_error": float(conservation["absolute_error"].detach().cpu()),
+            "conservation_abs_error": float(conservation["absolute_error"].detach().cpu()),
+            "conservation_relative_error": float(conservation["relative_error"].detach().cpu()),
+            "conservation_mean_token_error": float(conservation["mean_token_error"].detach().cpu()),
+            "conservation_finite": float(conservation["finite"].detach().cpu()),
+            "preprojection_abs_error": float(preprojection["absolute_error"].detach().cpu()),
+            "preprojection_relative_error": float(preprojection["relative_error"].detach().cpu()),
+            "preprojection_finite": float(preprojection["finite"].detach().cpu()),
+        }
+    )
+    return mixed, diagnostics
+
+
 def _project_trajectory_credit_sum(
     candidate: torch.Tensor,
     reference: torch.Tensor,
@@ -1292,6 +1570,104 @@ def turn_credit_conservation_stats(
         "mean_token_error": (absolute_by_row / token_count).max(),
         "finite": finite.to(torch.float64),
     }
+
+
+def segmented_turn_credit_conservation_stats(
+    original: torch.Tensor,
+    redistributed: torch.Tensor,
+    response_mask: torch.Tensor,
+    segment_trajectory_ids,
+) -> dict[str, torch.Tensor]:
+    """Check conservation after one rollout has been split into fragments."""
+    if original.shape != redistributed.shape or original.shape != response_mask.shape:
+        raise ValueError("turn credit tensors and response_mask must have identical shapes")
+    if len(segment_trajectory_ids) != original.shape[0]:
+        raise ValueError("segment trajectory ids must align with the batch")
+    mask = response_mask.bool()
+    original64 = torch.where(mask, original.to(torch.float64), 0.0)
+    redistributed64 = torch.where(mask, redistributed.to(torch.float64), 0.0)
+    original_by_group: dict[object, torch.Tensor] = {}
+    redistributed_by_group: dict[object, torch.Tensor] = {}
+    signal_by_group: dict[object, torch.Tensor] = {}
+    for row, trajectory_id in enumerate(segment_trajectory_ids):
+        if isinstance(trajectory_id, np.ndarray):
+            trajectory_id = trajectory_id.item()
+        try:
+            key = trajectory_id
+            hash(key)
+        except TypeError:
+            key = str(trajectory_id)
+        zero = torch.zeros((), device=original.device, dtype=torch.float64)
+        original_by_group[key] = original_by_group.get(key, zero) + original64[row].sum()
+        redistributed_by_group[key] = redistributed_by_group.get(key, zero) + redistributed64[row].sum()
+        signal_by_group[key] = signal_by_group.get(key, zero) + torch.maximum(
+            original64[row].abs().sum(), redistributed64[row].abs().sum()
+        )
+    if not original_by_group:
+        zero = torch.zeros((), device=original.device, dtype=torch.float64)
+        return {
+            "absolute_error": zero,
+            "relative_error": zero,
+            "mean_token_error": zero,
+            "finite": torch.tensor(1.0, device=original.device, dtype=torch.float64),
+        }
+    original_values = torch.stack(list(original_by_group.values()))
+    redistributed_values = torch.stack(
+        [redistributed_by_group[key] for key in original_by_group]
+    )
+    signal_scale = torch.stack(
+        [signal_by_group[key] for key in original_by_group]
+    ).clamp_min(1.0)
+    error = torch.abs(original_values - redistributed_values)
+    finite = (
+        torch.isfinite(original_values).all()
+        & torch.isfinite(redistributed_values).all()
+        & torch.isfinite(error).all()
+    )
+    return {
+        "absolute_error": error.max(),
+        "relative_error": (error / signal_scale).max(),
+        "mean_token_error": error.mean(),
+        "finite": finite.to(torch.float64),
+    }
+
+
+def _project_segmented_trajectory_credit_sum(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    response_mask: torch.Tensor,
+    segment_trajectory_ids,
+) -> torch.Tensor:
+    """Project credit sums per original rollout, not per fragment row."""
+    projected = candidate.clone()
+    groups = defaultdict(list)
+    for row, trajectory_id in enumerate(segment_trajectory_ids):
+        try:
+            hash(trajectory_id)
+            key = trajectory_id
+        except TypeError:
+            key = str(trajectory_id)
+        groups[key].append(row)
+    for rows in groups.values():
+        positions = [
+            (row, position)
+            for row in rows
+            for position in torch.where(response_mask[row].bool())[0].tolist()
+        ]
+        if not positions:
+            continue
+        target = sum(reference[row, position].to(torch.float64) for row, position in positions)
+        for _ in range(2):
+            actual = sum(projected[row, position].to(torch.float64) for row, position in positions)
+            residual = target - actual
+            row, position = min(
+                positions,
+                key=lambda item: abs(float(projected[item[0], item[1]].detach().cpu())),
+            )
+            projected[row, position] = (
+                projected[row, position].to(torch.float64) + residual
+            ).to(projected.dtype)
+    return projected
 
 
 def turn_credit_conservation_error(

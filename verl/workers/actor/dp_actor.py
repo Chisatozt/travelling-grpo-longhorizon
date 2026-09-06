@@ -85,6 +85,7 @@ class DataParallelPPOActor(BasePPOActor):
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
+        is_segmented = "segment_response_mask" in micro_batch.keys()
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -99,6 +100,51 @@ class DataParallelPPOActor(BasePPOActor):
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+
+            if is_segmented:
+                # A cleaned fragment is represented by one left-padded native
+                # input of max_model_len.  Its response tokens are sparse in
+                # that input because the prompt is no longer a fixed-width
+                # prefix.  Compute next-token log-probs in absolute sequence
+                # positions; the segment_response_mask/loss_mask selects the
+                # trainable response positions downstream.
+                extra_args = {}
+                if self.use_fused_kernels:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )
+                if self.use_fused_kernels:
+                    shifted_log_probs = output.log_probs[:, :-1]
+                    shifted_entropy = output.entropy[:, :-1] if calculate_entropy else None
+                else:
+                    logits = output.logits
+                    logits = logits.div(temperature)
+                    shifted_log_probs = logprobs_from_logits(
+                        logits[:, :-1, :], input_ids[:, 1:], inplace_backward=not calculate_entropy
+                    )
+                    shifted_entropy = (
+                        verl_F.entropy_from_logits(logits[:, :-1, :])
+                        if calculate_entropy
+                        else None
+                    )
+                full_log_probs = torch.zeros(
+                    (batch_size, seqlen),
+                    device=shifted_log_probs.device,
+                    dtype=shifted_log_probs.dtype,
+                )
+                full_log_probs[:, 1:] = shifted_log_probs
+                if calculate_entropy:
+                    full_entropy = torch.zeros_like(full_log_probs)
+                    full_entropy[:, 1:] = shifted_entropy
+                    entropy = full_entropy
+                return entropy, full_log_probs
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
@@ -286,6 +332,8 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if "segment_response_mask" in data.batch.keys():
+            select_keys.append("segment_response_mask")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -334,6 +382,9 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        is_segmented = "segment_response_mask" in data.batch.keys()
+        if is_segmented:
+            select_keys.append("segment_response_mask")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -378,7 +429,9 @@ class DataParallelPPOActor(BasePPOActor):
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
-                    if multi_turn:
+                    if is_segmented and not multi_turn:
+                        response_mask = data["segment_response_mask"]
+                    elif multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]

@@ -129,3 +129,15 @@ outputs
 data/sft/_tmp*
 data/sft/_check*
 data/sft/qa_*
+
+# Docs
+docs/project_summary*
+docs/resume*
+docs/yyhdbl*
+ppt_output/
+.ppt_build/
+.codex-finalizer/
+.chart-data-REqdre/
+.chart-data-mDNgSI/
+docs/report_assets/
+

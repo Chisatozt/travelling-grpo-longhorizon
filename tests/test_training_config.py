@@ -65,6 +65,10 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["max_tool_call_tokens_per_turn"], 512)
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["tool_response_token_reserve"], 6144)
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["multi_turn"]["template_token_reserve"], 32)
+        cleanup = config["actor_rollout_ref"]["rollout"]["multi_turn"]["context_cleanup"]
+        self.assertFalse(cleanup["enabled"])
+        self.assertEqual(cleanup["target_context_tokens"], 20000)
+        self.assertEqual(cleanup["template_margin_tokens"], 32)
         self.assertFalse(config["actor_rollout_ref"]["rollout"]["val_kwargs"]["do_sample"])
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["val_kwargs"]["temperature"], 0)
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["val_kwargs"]["n"], 1)
@@ -81,6 +85,8 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertIn('actor_rollout_ref.model.lora_rank=32', train)
         self.assertIn('actor_rollout_ref.model.lora_alpha=64', train)
         self.assertIn('TURN_CREDIT_STAGE="${TURN_CREDIT_STAGE:-train}"', train)
+        self.assertIn('CONTEXT_CLEANUP_ENABLED="${CONTEXT_CLEANUP_ENABLED:-false}"', train)
+        self.assertIn('context_cleanup.enabled="$CONTEXT_CLEANUP_ENABLED"', train)
         self.assertIn('export OMP_NUM_THREADS=8', train)
         self.assertIn('GRPO_AUTO_SHUTDOWN', train)
         self.assertIn('--task-kind "$GRPO_MONITOR_KIND"', train)
@@ -93,6 +99,7 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertIn('max_reasoning_tokens_per_turn=2560', native)
         self.assertIn('max_tool_call_tokens_per_turn=512', native)
         self.assertIn('GRPO_MONITOR_KIND=validation', native)
+        self.assertIn('NATIVE_CONTEXT_CLEANUP_ENABLED', native)
         self.assertIn('OMP_NUM_THREADS=8', native)
 
 

@@ -58,6 +58,10 @@ from verl.trainer.ppo.validation_baseline import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.rollout_health import validate_initial_rollout_health
+from verl.trainer.ppo.segmented_rollout import (
+    expand_segmented_batch,
+    has_segmented_rollouts,
+)
 from verl.trainer.ppo.validation_passes import (
     PUBLIC_VALIDATION_METRICS,
     aggregate_validation_attempts,
@@ -171,7 +175,9 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
-    if multi_turn:
+    if "segment_response_mask" in data.batch.keys():
+        response_mask = data.batch["loss_mask"] if multi_turn else data.batch["segment_response_mask"]
+    elif multi_turn:
         loss_mask = data.batch["loss_mask"]
         response_mask = loss_mask[:, -response_length:]
     else:
@@ -210,6 +216,8 @@ def compute_response_mask(data: DataProto):
     Returns:
         torch.Tensor: The attention mask for the response tokens.
     """
+    if "segment_response_mask" in data.batch.keys():
+        return data.batch["segment_response_mask"]
     responses = data.batch["responses"]
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
@@ -378,6 +386,7 @@ def _apply_turn_credit_stage(
     diagnostics: dict[str, float],
     *,
     stage: str,
+    conservation_groups=None,
     conservation_atol: float = 1.0e-5,
     conservation_rtol: float = 1.0e-6,
 ) -> torch.Tensor:
@@ -392,11 +401,19 @@ def _apply_turn_credit_stage(
     ):
         raise ValueError("turn credit conservation tolerances must be finite and non-negative")
 
-    conservation = core_algos.turn_credit_conservation_stats(
-        original_advantages,
-        credited_advantages,
-        response_mask,
-    )
+    if conservation_groups is None:
+        conservation = core_algos.turn_credit_conservation_stats(
+            original_advantages,
+            credited_advantages,
+            response_mask,
+        )
+    else:
+        conservation = core_algos.segmented_turn_credit_conservation_stats(
+            original_advantages,
+            credited_advantages,
+            response_mask,
+            conservation_groups,
+        )
     abs_error = float(conservation["absolute_error"].detach().cpu())
     relative_error = float(conservation["relative_error"].detach().cpu())
     mean_token_error = float(conservation["mean_token_error"].detach().cpu())
@@ -446,6 +463,270 @@ def _apply_turn_credit_stage(
     return credited_advantages
 
 
+def _segment_metadata(data: DataProto) -> tuple[list, list, list]:
+    """Extract one fragment's public histories and global turn ids per row."""
+    raw_records = data.non_tensor_batch.get("segment_records", [])
+    if hasattr(raw_records, "tolist"):
+        raw_records = raw_records.tolist()
+    histories, global_indices, record_ids = [], [], []
+    for item in raw_records:
+        if isinstance(item, Mapping):
+            records = [item]
+        elif isinstance(item, (list, tuple)):
+            records = [record for record in item if isinstance(record, Mapping)]
+        else:
+            records = []
+        record = records[0] if records else {}
+        histories.append(record.get("conversation_history", []))
+        global_indices.append(record.get("global_turn_indices", []))
+        record_ids.append(record)
+    return histories, global_indices, record_ids
+
+
+def _unique_segment_rows(segment_trajectory_ids) -> tuple[list[int], list[str]]:
+    first_rows: list[int] = []
+    unique_ids: list[str] = []
+    seen: set[str] = set()
+    for row, value in enumerate(segment_trajectory_ids):
+        key = str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        first_rows.append(row)
+        unique_ids.append(key)
+    return first_rows, unique_ids
+
+
+def _compute_segmented_grpo_advantage(
+    data: DataProto,
+    *,
+    adv_estimator,
+    num_repeat: int,
+    multi_turn: bool,
+    turn_level_method: str,
+    norm_adv_by_std_in_grpo: bool,
+    config,
+) -> DataProto:
+    """Compute GRPO once per rollout, then map the result to its fragments."""
+    response_mask = data.batch["response_mask"]
+    grpo_mask = data.batch["loss_mask"] if multi_turn else response_mask
+    segment_ids = data.non_tensor_batch.get("segment_trajectory_uid")
+    if segment_ids is None:
+        raise ValueError("segmented rollouts require segment_trajectory_uid metadata")
+    segment_ids = [str(value) for value in np.asarray(segment_ids, dtype=object).reshape(-1)]
+    first_rows, unique_segment_ids = _unique_segment_rows(segment_ids)
+    unique_rows = torch.tensor(first_rows, device=data.batch["token_level_rewards"].device)
+    unique_uids = np.asarray(data.non_tensor_batch["uid"], dtype=object)[first_rows]
+    terminal_scores, reward_valid = _extract_terminal_reward_metadata(data)
+    if terminal_scores is not None:
+        terminal_scores_unique = terminal_scores[unique_rows]
+        reward_valid_unique = reward_valid[unique_rows]
+        from verl.trainer.ppo.dynamic_sampling import (
+            resolve_reward_spread_thresholds,
+            select_reward_varying_groups,
+        )
+
+        expected_group_size = max(2, int(num_repeat or 1))
+        numerical_epsilon, min_reward_spread = resolve_reward_spread_thresholds(
+            (config or {}).get("dynamic_sampling", {})
+        )
+        kept_indices, sampling_stats = select_reward_varying_groups(
+            unique_uids,
+            terminal_scores_unique.detach().cpu().tolist(),
+            reward_valid=reward_valid_unique.detach().cpu().tolist(),
+            expected_group_size=expected_group_size,
+            numerical_epsilon=numerical_epsilon,
+            min_reward_spread=min_reward_spread,
+        )
+        if data.meta_info.get("travel_skip_update", False):
+            kept_indices = []
+            sampling_stats = dict(sampling_stats)
+            sampling_stats["bounded_retry_exhausted"] = True
+        data.meta_info["terminal_sampling_stats"] = sampling_stats
+        unique_reward = torch.zeros(
+            (len(first_rows), 1),
+            device=data.batch["token_level_rewards"].device,
+            dtype=data.batch["token_level_rewards"].dtype,
+        )
+        unique_mask = torch.ones_like(unique_reward)
+        unique_advantage, _ = core_algos.compute_terminal_group_advantage(
+            token_level_rewards=unique_reward,
+            response_mask=unique_mask,
+            index=unique_uids,
+            terminal_scores=terminal_scores_unique,
+            reward_valid=reward_valid_unique,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        keep_ids = {
+            unique_segment_ids[index]
+            for index in kept_indices
+            if 0 <= int(index) < len(unique_segment_ids)
+        }
+        scalar_by_segment_id = {
+            unique_segment_ids[index]: unique_advantage[index, 0]
+            for index in range(len(unique_segment_ids))
+        }
+        advantages = torch.zeros_like(data.batch["token_level_rewards"])
+        trainable_rows = []
+        for row, segment_id in enumerate(segment_ids):
+            scalar = scalar_by_segment_id.get(segment_id)
+            is_trainable = segment_id in keep_ids and scalar is not None
+            trainable_rows.append(is_trainable)
+            if is_trainable:
+                advantages[row] = scalar * grpo_mask[row]
+        returns = advantages.clone()
+    else:
+        # Generic reward managers do not provide TravelGym's terminal ledger.
+        # Aggregate each original rollout once so repeated fragments cannot
+        # change its GRPO group statistics.
+        unique_rewards = torch.stack(
+            [data.batch["token_level_rewards"][
+                [row for row, value in enumerate(segment_ids) if value == segment_id]
+            ].sum() for segment_id in unique_segment_ids]
+        ).reshape(-1, 1)
+        unique_mask = torch.ones_like(unique_rewards)
+        unique_reward_advantage, _ = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=unique_rewards,
+            response_mask=unique_mask,
+            index=unique_uids,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        scalar_by_segment_id = {
+            segment_id: unique_reward_advantage[index, 0]
+            for index, segment_id in enumerate(unique_segment_ids)
+        }
+        advantages = torch.stack(
+            [scalar_by_segment_id[segment_id] * grpo_mask[row] for row, segment_id in enumerate(segment_ids)]
+        )
+        returns = advantages.clone()
+        terminal_scores = None
+        reward_valid = None
+
+    turn_credit_config = (config or {}).get("turn_credit", {})
+    if not isinstance(turn_credit_config, Mapping):
+        turn_credit_config = {}
+    turn_mode = str(turn_credit_config.get("method", turn_level_method or "off"))
+    credit_stage = str(
+        turn_credit_config.get(
+            "stage",
+            (config or {}).get("turn_credit_stage", "off"),
+        )
+    ).casefold()
+    valid_turn_modes = {
+        "off",
+        "none",
+        "equalized",
+        "r2g",
+        "em",
+        "component_attribution",
+        "behavior_component",
+        "behavior_delta",
+    }
+    if turn_mode.casefold() not in valid_turn_modes:
+        raise ValueError(f"invalid turn credit method: {turn_mode}")
+    if credit_stage not in {"off", "shadow", "train"}:
+        raise ValueError(f"invalid turn credit stage: {credit_stage}")
+    if (
+        terminal_scores is not None
+        and turn_mode.casefold() not in {"off", "none"}
+        and credit_stage in {"shadow", "train"}
+    ):
+        histories, global_indices, _ = _segment_metadata(data)
+        if turn_mode.casefold() in {
+            "component_attribution",
+            "behavior_component",
+            "behavior_delta",
+        }:
+            component_payload = _extract_terminal_reward_components(data, terminal_scores)
+            if component_payload is None:
+                if credit_stage == "train":
+                    raise ValueError(
+                        "component turn credit requires complete TravelGym reward metadata"
+                    )
+                credited_advantages = advantages
+                diagnostics = {"component_metadata_missing": 1.0}
+            else:
+                component_names, reward_components = component_payload
+                unique_components = reward_components[unique_rows]
+                unique_component_advantages = core_algos.compute_terminal_component_advantages(
+                    terminal_scores[unique_rows],
+                    unique_components,
+                    unique_uids,
+                    reward_valid=reward_valid[unique_rows],
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                )
+                component_by_id = {
+                    unique_segment_ids[index]: unique_component_advantages[index]
+                    for index in range(len(unique_segment_ids))
+                }
+                component_advantages = torch.stack(
+                    [component_by_id[segment_id] for segment_id in segment_ids]
+                )
+                train_mask = torch.tensor(
+                    [segment_id in keep_ids for segment_id in segment_ids],
+                    device=advantages.device,
+                    dtype=advantages.dtype,
+                )
+                component_advantages = component_advantages * train_mask.unsqueeze(-1)
+                routing = turn_credit_config.get("routing", {})
+                if OmegaConf.is_config(routing):
+                    routing = OmegaConf.to_container(routing, resolve=True)
+                credited_advantages, diagnostics = core_algos.redistribute_segmented_behavior_component_turn_credit(
+                    advantages,
+                    grpo_mask,
+                    data.batch["turn_boundaries"],
+                    segment_ids,
+                    histories,
+                    global_indices,
+                    component_advantages,
+                    component_names,
+                    mix_ratio=float(turn_credit_config.get("mix_ratio", 0.30)),
+                    routing=routing,
+                )
+        else:
+            credited_advantages = core_algos.redistribute_segmented_terminal_turn_credit(
+                advantages,
+                grpo_mask,
+                data.batch["turn_boundaries"],
+                segment_ids,
+                histories,
+                global_indices,
+            )
+            conservation = core_algos.segmented_turn_credit_conservation_stats(
+                advantages,
+                credited_advantages,
+                grpo_mask,
+                segment_ids,
+            )
+            diagnostics = {
+                "conservation_error": float(conservation["absolute_error"].detach().cpu()),
+                "conservation_abs_error": float(conservation["absolute_error"].detach().cpu()),
+                "conservation_relative_error": float(conservation["relative_error"].detach().cpu()),
+                "conservation_mean_token_error": float(conservation["mean_token_error"].detach().cpu()),
+                "conservation_finite": float(conservation["finite"].detach().cpu()),
+            }
+        advantages = _apply_turn_credit_stage(
+            advantages,
+            credited_advantages,
+            grpo_mask,
+            diagnostics,
+            stage=credit_stage,
+            conservation_groups=segment_ids,
+            conservation_atol=float(turn_credit_config.get("conservation_atol", 1.0e-5)),
+            conservation_rtol=float(turn_credit_config.get("conservation_rtol", 1.0e-6)),
+        )
+        returns = advantages.clone()
+        data.meta_info["turn_credit_conservation_error"] = diagnostics.get(
+            "conservation_abs_error", diagnostics.get("conservation_error", 0.0)
+        )
+        data.meta_info["turn_credit_applied"] = diagnostics.get("applied", 0.0)
+        data.meta_info["turn_credit_diagnostics"] = diagnostics
+
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = returns
+    return data
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, turn_level_method="Equalized", trajectory_score_method="Sum", norm_adv_by_std_in_grpo=True, config=None):
     """Compute advantage estimates for policy optimization.
 
@@ -470,6 +751,19 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    if has_segmented_rollouts(data) and adv_estimator in {
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_MULTITURN,
+    }:
+        return _compute_segmented_grpo_advantage(
+            data,
+            adv_estimator=adv_estimator,
+            num_repeat=num_repeat,
+            multi_turn=multi_turn,
+            turn_level_method=turn_level_method,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -1119,7 +1413,15 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        rollout_metadata=None,
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -1135,6 +1437,9 @@ class RayPPOTrainer:
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
+        for key, values in (rollout_metadata or {}).items():
+            if len(values) == n:
+                base_data[key] = values.tolist() if hasattr(values, "tolist") else values
 
         with open(filename, "w") as f:
             for i in range(n):
@@ -1365,6 +1670,26 @@ class RayPPOTrainer:
         return str(value)
 
     @staticmethod
+    def _validation_json_value(value: Any):
+        """Convert rollout ledgers to JSON without flattening their structure."""
+        if isinstance(value, np.ndarray):
+            return RayPPOTrainer._validation_json_value(value.tolist())
+        if isinstance(value, np.generic):
+            return value.item()
+        if hasattr(value, "model_dump"):
+            return RayPPOTrainer._validation_json_value(value.model_dump(exclude_none=True))
+        if isinstance(value, Mapping):
+            return {
+                str(key): RayPPOTrainer._validation_json_value(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [RayPPOTrainer._validation_json_value(child) for child in value]
+        if value is None or isinstance(value, (str, bool, int, float)):
+            return value
+        return str(value)
+
+    @staticmethod
     def _validation_number(value: Any, default: float = 0.0) -> float:
         try:
             number = float(value)
@@ -1393,19 +1718,38 @@ class RayPPOTrainer:
             "score",
             "reward_valid",
             "reward_version",
+            "segment_records",
+            "cleanup_events",
+            "archive_messages",
+            "archive_model_outputs",
+            "archive_segment_records",
+            "archive_turns",
+            "length_events",
         }
         with open(generations_path, "w", encoding="utf-8") as handle:
             for record in records:
-                payload = {
-                    key: self._public_validation_scalar(value)
-                    for key, value in record.items()
-                    if key in allowed
-                }
+                payload = {}
+                for key, value in record.items():
+                    if key not in allowed:
+                        continue
+                    if key in {
+                        "segment_records",
+                        "cleanup_events",
+                        "archive_messages",
+                        "archive_model_outputs",
+                        "archive_segment_records",
+                        "archive_turns",
+                        "length_events",
+                    }:
+                        payload[key] = self._validation_json_value(value)
+                    else:
+                        payload[key] = self._public_validation_scalar(value)
                 payload["step"] = int(self.global_steps)
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
         rollout_config = self.config.actor_rollout_ref.rollout
         multi_turn_config = rollout_config.get("multi_turn", {})
+        context_cleanup_config = multi_turn_config.get("context_cleanup", {}) or {}
         protocol = {
             "schema_version": "travelgym-native-validation-v1",
             "backend": str(rollout_config.get("name", "unknown")),
@@ -1416,6 +1760,21 @@ class RayPPOTrainer:
             "max_new_tokens_per_turn": int(multi_turn_config.get("max_new_tokens_per_turn", 0)),
             "tool_response_token_reserve": int(multi_turn_config.get("tool_response_token_reserve", 0)),
             "template_token_reserve": int(multi_turn_config.get("template_token_reserve", 0)),
+            "context_cleanup_enabled": bool(
+                context_cleanup_config.get("enabled", False)
+            ),
+            "context_cleanup_target_tokens": int(
+                context_cleanup_config.get("target_context_tokens", 20000)
+            ),
+            "context_cleanup_template_margin_tokens": int(
+                context_cleanup_config.get("template_margin_tokens", 32)
+            ),
+            "next_turn_reserve": int(
+                multi_turn_config.get("max_reasoning_tokens_per_turn", 0)
+                + multi_turn_config.get("max_tool_call_tokens_per_turn", 0)
+                + multi_turn_config.get("tool_response_token_reserve", 0)
+                + context_cleanup_config.get("template_margin_tokens", 32)
+            ),
             "tool_call_parser": str(multi_turn_config.get("tool_call_parser", "")),
             "do_sample": bool(rollout_config.val_kwargs.get("do_sample", False)),
             "temperature": float(rollout_config.val_kwargs.get("temperature", 0.0)),
@@ -1598,6 +1957,20 @@ class RayPPOTrainer:
                             record[metric] = self._public_validation_scalar(
                                 extra[metric][local_index]
                             )
+                    for key in (
+                        "segment_records",
+                        "cleanup_events",
+                        "archive_messages",
+                        "archive_model_outputs",
+                        "archive_segment_records",
+                        "archive_turns",
+                        "length_events",
+                    ):
+                        values = generated.non_tensor_batch.get(key)
+                        if values is not None and local_index < len(values):
+                            record[key] = self._validation_json_value(
+                                values[local_index]
+                            )
                     attempts_by_task.setdefault(task_key, []).append(record)
                     all_records.append(record)
                     all_inputs.append(record["input"])
@@ -1688,6 +2061,16 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        validation_rollout_metadata: dict[str, list] = defaultdict(list)
+        rollout_metadata_keys = (
+            "segment_records",
+            "cleanup_events",
+            "archive_messages",
+            "archive_model_outputs",
+            "archive_segment_records",
+            "archive_turns",
+            "length_events",
+        )
         validation_retry_stats = {
             "retried_rows": 0,
             "recovered_rows": 0,
@@ -1747,6 +2130,16 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            for key in rollout_metadata_keys:
+                values = test_output_gen_batch.non_tensor_batch.get(key)
+                if values is None or len(values) != len(output_texts):
+                    validation_rollout_metadata[key].extend(
+                        [None] * len(output_texts)
+                    )
+                else:
+                    validation_rollout_metadata[key].extend(
+                        [self._validation_json_value(value) for value in values]
+                    )
 
             test_batch = test_batch.union(test_output_gen_batch)
 
@@ -1774,6 +2167,7 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                rollout_metadata=validation_rollout_metadata,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -2426,11 +2820,42 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, gamma=self.config.algorithm.gamma)
 
+                    # Context-cleaned rollouts are expanded only after the
+                    # original trajectory reward has been computed.  This
+                    # keeps terminal reward and dynamic sampling at the
+                    # rollout level while giving every fragment its real
+                    # model input for probability recomputation.
+                    if has_segmented_rollouts(batch):
+                        if self.config.reward_model.launch_reward_fn_async:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            future_reward = None
+                        batch, reward_tensor, reward_extra_infos_dict = expand_segmented_batch(
+                            batch,
+                            reward_tensor,
+                            reward_extra_infos_dict,
+                            max_model_len=int(self.config.actor_rollout_ref.rollout.max_model_len),
+                            pad_token_id=int(self.tokenizer.pad_token_id or 0),
+                        )
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
+
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
+                        if (
+                            has_segmented_rollouts(batch)
+                            and self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        ):
+                            # Entropy is a training diagnostic too: tool
+                            # observations are conditioning, not Actor
+                            # targets, so do not include them in the token
+                            # average for a cleaned fragment.
+                            response_masks = batch.batch["loss_mask"]
+                        else:
+                            response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
@@ -2445,7 +2870,11 @@ class RayPPOTrainer:
                             attention_mask = batch.batch["attention_mask"]
                             responses = batch.batch["responses"]
                             response_length = responses.size(1)
-                            response_mask = attention_mask[:, -response_length:]
+                            response_mask = (
+                                batch.batch["loss_mask"]
+                                if has_segmented_rollouts(batch)
+                                else attention_mask[:, -response_length:]
+                            )
 
                             rollout_probs = torch.exp(rollout_old_log_probs)
                             actor_probs = torch.exp(actor_old_log_probs)
@@ -2480,7 +2909,7 @@ class RayPPOTrainer:
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and future_reward is not None:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
@@ -2572,6 +3001,19 @@ class RayPPOTrainer:
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
+                                rollout_metadata={
+                                    key: batch.non_tensor_batch[key]
+                                    for key in (
+                                        "segment_records",
+                                        "cleanup_events",
+                                        "archive_messages",
+                                        "archive_model_outputs",
+                                        "archive_segment_records",
+                                        "archive_turns",
+                                        "length_events",
+                                    )
+                                    if key in batch.non_tensor_batch
+                                },
                             )
 
                     # Periodic saves follow trainer.save_freq (20 for the

@@ -89,6 +89,10 @@ actor_rollout_ref:
       enable: True
       max_turns: 25
       model_name: gpt-4o
+      # Inference-only Actor plan extraction; null defers to the shared
+      # TRAVELGYM_ENABLE_ACTOR_ASPECT_EXTRACTION environment switch.
+      enable_actor_aspect_extraction: null
+      actor_aspect_extraction_max_tokens: 128
       turn_level_method: "component_attribution"
       trajectory_score_method: Terminal
       use_inference_chat_template: true
@@ -106,6 +110,12 @@ actor_rollout_ref:
       max_tool_call_tokens_per_turn: 512
       tool_response_token_reserve: 6144
       template_token_reserve: 32
+      # Optional native-context compaction.  Off preserves the historical
+      # single-fragment 1280 + 31488 rollout path.
+      context_cleanup:
+        enabled: false
+        target_context_tokens: 20000
+        template_margin_tokens: 32
       # Verify this parser name against the installed SGLang build before
       # launching.  A mismatch must fail fast instead of silently selecting a
       # Hermes/legacy parser that changes Qwen3.5 tool-call tokenisation.

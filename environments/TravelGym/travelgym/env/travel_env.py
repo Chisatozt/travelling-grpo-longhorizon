@@ -21,6 +21,12 @@ from .user_simulator import (
     initialize_preferences,
     new_user_telemetry,
 )
+from .actor_aspects import (
+    ActorAspectExtractionResult,
+    actor_aspect_extraction_enabled,
+    coerce_actor_aspect_result,
+    new_actor_aspect_telemetry,
+)
 
 try:  # Gymnasium is optional for offline unit tests.
     import gymnasium as gym
@@ -100,7 +106,7 @@ class TravelEnv(BaseEnv):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, *, actor_aspect_result=None):
         if config is None:
             from ..config import get_default_config
 
@@ -123,6 +129,15 @@ class TravelEnv(BaseEnv):
         self._api_telemetry = new_user_telemetry()
         self._task_id: str | None = None
         self._task: dict[str, Any] | None = None
+        self._required_aspects: list[str] = []
+        self._actor_aspects: list[str] = []
+        self._pending_actor_aspect_result = actor_aspect_result
+        self._actor_aspect_result: dict[str, Any] = {}
+        self._actor_aspect_format_error: str | None = None
+        self._actor_aspect_invalid_aspects: list[str] = []
+        self._actor_aspect_duplicate_aspects: list[str] = []
+        self._actor_aspect_error_count = 0
+        self._actor_aspect_telemetry = new_actor_aspect_telemetry()
         self._steps = 0
         self._current_aspect: str | None = None
         self._searched: set[str] = set()
@@ -171,10 +186,9 @@ class TravelEnv(BaseEnv):
 
     @property
     def _aspects(self) -> list[str]:
-        if not self._task:
-            return []
-        raw = self._task.get("dimensions") or []
-        return [str(value) for value in raw if str(value) in self._task]
+        """Return the Actor-selected execution order, never the task labels."""
+
+        return list(self._actor_aspects)
 
     def _select_task_id(self) -> str:
         mode = str(getattr(self.config, "data_mode", "random"))
@@ -190,14 +204,74 @@ class TravelEnv(BaseEnv):
             raise KeyError(f"TravelGym scenario not found: {source!r}")
         return available[0] if mode in {"single", "list"} else self._rng.choice(available)
 
+    def set_actor_aspect_extraction(self, result: Any) -> None:
+        """Provide the pre-reset Actor plan without exposing task labels.
+
+        Rollout callers run the extraction before ``reset`` creates public
+        state, then pass the private in-process result through this setter.
+        The result is consumed by the next reset only.
+        """
+
+        self._pending_actor_aspect_result = result
+
+    # Keep a descriptive alias for callers that name the value as a result.
+    set_actor_aspect_result = set_actor_aspect_extraction
+
+    def _initialize_aspect_plan(self) -> None:
+        raw_required = (
+            self._task.get("dimensions") or []
+            if self._task
+        else []
+        )
+        self._required_aspects = [str(value) for value in raw_required]
+        extraction_enabled = actor_aspect_extraction_enabled(
+            getattr(self.config, "enable_actor_aspect_extraction", None)
+        )
+        if not extraction_enabled:
+            self._pending_actor_aspect_result = None
+            self._actor_aspects = [
+                aspect
+                for aspect in self._required_aspects
+                if self._task and aspect in self._task
+            ]
+            self._actor_aspect_result = {}
+            self._actor_aspect_format_error = None
+            self._actor_aspect_invalid_aspects = []
+            self._actor_aspect_duplicate_aspects = []
+            self._actor_aspect_error_count = 0
+            self._actor_aspect_telemetry = new_actor_aspect_telemetry()
+            return
+
+        if self._pending_actor_aspect_result is None:
+            result = ActorAspectExtractionResult(
+                format_error="actor_aspect_result_unavailable",
+            )
+        else:
+            result = coerce_actor_aspect_result(self._pending_actor_aspect_result)
+        self._pending_actor_aspect_result = None
+        self._actor_aspects = list(result.aspects)
+        self._actor_aspect_result = result.to_dict()
+        self._actor_aspect_format_error = result.format_error
+        self._actor_aspect_invalid_aspects = list(result.invalid_aspects)
+        self._actor_aspect_duplicate_aspects = list(result.duplicate_aspects)
+        self._actor_aspect_error_count = result.error_count
+        self._actor_aspect_telemetry = new_actor_aspect_telemetry()
+        for key in self._actor_aspect_telemetry:
+            value = result.telemetry.get(key, 0)
+            try:
+                self._actor_aspect_telemetry[key] = float(value) if key.endswith("seconds") else int(value)
+            except (TypeError, ValueError):
+                self._actor_aspect_telemetry[key] = 0.0 if key.endswith("seconds") else 0
+
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         del options
         if seed is not None:
             self._rng.seed(seed)
         self._task_id = self._select_task_id()
         self._task = copy.deepcopy(self._tasks[self._task_id])
+        self._initialize_aspect_plan()
         self._steps = 0
-        self._current_aspect = self._aspects[0] if self._aspects else None
+        self._current_aspect = self._actor_aspects[0] if self._actor_aspects else None
         self._searched = set()
         self._answered = set()
         self._visible = {}
@@ -534,6 +608,14 @@ class TravelEnv(BaseEnv):
             return self._reject("Tool call rejected: cross-aspect operation.")
         if aspect in self._answered:
             return self._reject("Tool call rejected: the aspect was already answered.")
+        if aspect not in _ASPECT_HINTS:
+            return self._reject(
+                "Tool call rejected: the Actor aspect plan contains an unsupported category."
+            )
+        if self._task is None or aspect not in self._task:
+            return self._reject(
+                "Tool call rejected: no options are available for this aspect."
+            )
 
         if choice == "search":
             if aspect in self._searched:
@@ -617,6 +699,14 @@ class TravelEnv(BaseEnv):
             return self._reject("Tool call rejected: cross-aspect operation.")
         if aspect in self._answered:
             return self._reject("Tool call rejected: the aspect was already answered.")
+        if aspect not in _ASPECT_HINTS:
+            return self._reject(
+                "Tool call rejected: the Actor aspect plan contains an unsupported category."
+            )
+        if self._task is None or aspect not in self._task:
+            return self._reject(
+                "Tool call rejected: no options are available for this aspect."
+            )
         if aspect not in self._searched:
             return self._reject("Tool call rejected: action-before-search.")
         if self._deadline_blocks_action():
@@ -675,12 +765,15 @@ class TravelEnv(BaseEnv):
     def _build_terminal_report(self) -> dict[str, Any]:
         if self._terminal_report is not None:
             return copy.deepcopy(self._terminal_report)
-        total = len(self._aspects)
-        answered = len(self._answered)
+        # Execution follows the Actor plan, but completion metrics must use
+        # the private task requirements so an omitted aspect cannot disappear
+        # from the denominator.
+        total = len(self._required_aspects)
+        answered = sum(1 for aspect in self._required_aspects if aspect in self._answers)
         correct = 0
         best = 0
         legal = 0
-        for aspect in self._aspects:
+        for aspect in self._required_aspects:
             answer = self._answers.get(aspect, "").upper()
             info = self._task.get(aspect, {}) if self._task else {}
             correct_ids = {str(value).upper() for value in info.get("correct_ids", [])}
@@ -693,7 +786,7 @@ class TravelEnv(BaseEnv):
                 legal += 1
         preferences_total = sum(
             len(values)
-            for aspect in self._aspects
+            for aspect in self._required_aspects
             if isinstance(
                 values := (self._task.get(aspect, {}).get("preferences", []) if self._task else []),
                 list,
@@ -713,7 +806,13 @@ class TravelEnv(BaseEnv):
         hidden_hit_rate = agent_preferences_seen / preferences_total if preferences_total else 1.0
         max_steps = max(1, int(getattr(self.config, "max_steps", 25)))
         efficiency = max(0.0, 1.0 - min(1.0, self._steps / max_steps))
-        policy_penalty = min(1.0, 0.05 * self._invalid_calls + 0.10 * self._wrong_answers)
+        actor_aspect_plan_penalty = min(0.60, 0.05 * self._actor_aspect_error_count)
+        policy_penalty = min(
+            1.0,
+            0.05 * self._invalid_calls
+            + 0.10 * self._wrong_answers
+            + actor_aspect_plan_penalty,
+        )
         early_redundant = min(3, self._redundant_action_count)
         later_redundant = max(0, self._redundant_action_count - 3)
         redundant_action_penalty = min(0.60, 0.05 * early_redundant + 0.10 * later_redundant)
@@ -742,6 +841,9 @@ class TravelEnv(BaseEnv):
             key: value for key, value in telemetry.items()
             if str(key).startswith("user_") and isinstance(value, (int, float))
         }
+        extraction_enabled = actor_aspect_extraction_enabled(
+            getattr(self.config, "enable_actor_aspect_extraction", None)
+        )
         self._terminal_report = {
             "reward_version": self.config.reward_version,
             "terminal_reward": terminal,
@@ -767,8 +869,25 @@ class TravelEnv(BaseEnv):
             "duplicate_action_count": self._duplicate_action_count,
             "invalid_call_count": self._invalid_calls,
             "wrong_answer_count": self._wrong_answers,
+            "actor_aspect_extraction_enabled": extraction_enabled,
+            "actor_aspects": (
+                copy.deepcopy(self._actor_aspects)
+                if extraction_enabled
+                else None
+            ),
+            "actor_aspects_raw": (
+                copy.deepcopy(self._actor_aspect_result.get("raw_aspects", []))
+                if extraction_enabled
+                else None
+            ),
+            "actor_aspect_extraction_format_error": self._actor_aspect_format_error,
+            "actor_aspect_extraction_invalid_aspects": list(self._actor_aspect_invalid_aspects),
+            "actor_aspect_extraction_duplicate_aspects": list(self._actor_aspect_duplicate_aspects),
+            "actor_aspect_extraction_error_count": self._actor_aspect_error_count,
+            "actor_aspect_extraction_direct_grpo_signal": False,
             "efficiency": efficiency,
             "policy_penalty": policy_penalty,
+            "actor_aspect_plan_penalty": actor_aspect_plan_penalty,
             "redundant_action_penalty": redundant_action_penalty,
             "incomplete_penalty": incomplete_penalty,
             "zero_answer_penalty": zero_answer_penalty,
@@ -778,6 +897,7 @@ class TravelEnv(BaseEnv):
             "termination_reason": self._termination_reason or "rollout_complete",
             "user_simulator_mode": self.config.user_simulator_mode,
             "user_simulator_error": self._simulator_error,
+            **self._actor_aspect_telemetry,
             **user_metrics,
         }
         return copy.deepcopy(self._terminal_report)

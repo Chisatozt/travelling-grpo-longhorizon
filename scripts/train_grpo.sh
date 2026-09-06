@@ -40,6 +40,22 @@ RUN_UNTIL_STEP="${RUN_UNTIL_STEP:-100}"
 USE_TRAIN_FILES_FOR_VAL="${USE_TRAIN_FILES_FOR_VAL:-false}"
 TURN_CREDIT_STAGE="${TURN_CREDIT_STAGE:-train}"
 TURN_CREDIT_MIX_RATIO="${TURN_CREDIT_MIX_RATIO:-0.30}"
+CONTEXT_CLEANUP_ENABLED="${CONTEXT_CLEANUP_ENABLED:-false}"
+CONTEXT_CLEANUP_TARGET_TOKENS="${CONTEXT_CLEANUP_TARGET_TOKENS:-20000}"
+CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS="${CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS:-32}"
+
+case "$CONTEXT_CLEANUP_ENABLED" in
+    true|false)
+        ;;
+    *)
+        echo "CONTEXT_CLEANUP_ENABLED must be true or false" >&2
+        exit 2
+        ;;
+esac
+if [[ ! "$CONTEXT_CLEANUP_TARGET_TOKENS" =~ ^[1-9][0-9]*$ || ! "$CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS" =~ ^[0-9]+$ ]]; then
+    echo "CONTEXT_CLEANUP_TARGET_TOKENS must be positive and CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS must be non-negative" >&2
+    exit 2
+fi
 
 case "$TURN_CREDIT_STAGE" in
     off|shadow|train)
@@ -161,6 +177,9 @@ GRPO_COMMAND=(
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/configs/tools/interact_tool_config.yaml"
     actor_rollout_ref.rollout.multi_turn.turn_level_method="component_attribution"
     actor_rollout_ref.rollout.multi_turn.trajectory_score_method="Terminal"
+    actor_rollout_ref.rollout.multi_turn.context_cleanup.enabled="$CONTEXT_CLEANUP_ENABLED"
+    actor_rollout_ref.rollout.multi_turn.context_cleanup.target_context_tokens="$CONTEXT_CLEANUP_TARGET_TOKENS"
+    actor_rollout_ref.rollout.multi_turn.context_cleanup.template_margin_tokens="$CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS"
     actor_rollout_ref.hybrid_engine=True
     actor_rollout_ref.ref.fsdp_config.param_offload=True
     algorithm.use_kl_in_reward=False

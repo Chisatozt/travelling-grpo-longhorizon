@@ -50,6 +50,47 @@ configs/grpo/grpo_multiturn.yaml 通过 Hydra search path 继承 veRL 的 ppo_tr
 正式 GRPO 的 validation 是每个 task 一次普通 greedy attempt；独立的
 evaluate_native.sh 才使用 pass@3 sampled evaluation。
 
+## 危险上下文清理（默认关闭）
+
+长轨迹需要下一完整轮的安全预算时，可以让 native SGLang rollout 清理按完成顺序
+已经合法提交的 aspect。清理只修改 Actor 的活动 prompt：初始需求、当前活动上下文、
+最新公开状态和已公开的用户回复原文会保留；完整交互归档仍保留所有原始模型输出、工具
+返回、全局 turn 和清理前后的片段记录。每个清理点会把同一条 rollout 切成一个新的训练
+片段，old/reference log-prob 与 Actor loss 都使用该片段实际发送的 native token 序列，
+终局 Reward、动态采样和 Turn Credit 仍按原始 rollout 计算一次。
+
+配置位于 `actor_rollout_ref.rollout.multi_turn.context_cleanup`：
+
+- `enabled: false`：默认值，保留原来的单片段 `1280 + 31488` 行为；
+- `target_context_tokens: 20000`：清理后的期望活动上下文长度；
+- `template_margin_tokens: 32`：放在 reasoning、tool call 和工具返回预留之外的模板余量。
+
+下一轮危险阈值由当前 reasoning 上限、tool-call 上限、工具返回预留和模板余量动态推导，
+不是固定的 30K 截断。若没有可清理历史或仍无法容纳下一轮，继续走原有的长度隔离处理。
+
+正式训练启用方式（不要在本地验证时直接启动完整实验）：
+
+~~~bash
+CONTEXT_CLEANUP_ENABLED=true \
+CONTEXT_CLEANUP_TARGET_TOKENS=20000 \
+CONTEXT_CLEANUP_TEMPLATE_MARGIN_TOKENS=32 \
+GRPO_AUTO_SHUTDOWN=0 \
+  bash scripts/train_grpo.sh
+~~~
+
+native 评估使用同一套 rollout 和训练对齐逻辑；评估入口额外提供 `NATIVE_` 前缀：
+
+~~~bash
+NATIVE_CONTEXT_CLEANUP_ENABLED=true \
+NATIVE_CONTEXT_CLEANUP_TARGET_TOKENS=20000 \
+  bash scripts/evaluate_native.sh smoke20
+~~~
+
+每条 rollout 的 `travel_rollout_length`、rollout 导出和 JSONL 会记录归档 token 数、活动
+上下文峰值、清理次数、释放量、删除 aspect/turn 范围、记忆 token 数、恢复结果和片段数。
+这版清理没有额外的 aspect 提取训练信号；若同时启用 Actor aspect 提取，它仍只是一次
+inference-only 规划调用，能力需要后续专门训练或奖励设计来学习。
+
 ## 启动前检查
 
 先确认模型是完整权重而不是 adapter-only：
